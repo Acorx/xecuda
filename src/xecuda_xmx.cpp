@@ -25,7 +25,35 @@ xeCudaError_t xeXmxMultiplyAccumulate(
     xeXmxMatrixTile_t* tileC
 ) {
     if (!tileA || !tileB || !tileC) return xeCudaErrorInvalidValue;
-    // XMX Hardware Tile Multiplication SIMD Operation
+    if (!tileA->dataPtr || !tileB->dataPtr || !tileC->dataPtr) return xeCudaErrorInvalidValue;
+
+    const int M = tileA->rows;
+    const int K = tileA->cols;
+    const int N = tileB->cols;
+
+    const float* A = static_cast<const float*>(tileA->dataPtr);
+    const float* B = static_cast<const float*>(tileB->dataPtr);
+    float* C = static_cast<float*>(tileC->dataPtr);
+
+    const int TILE = 32;
+
+#pragma omp parallel for collapse(2) schedule(dynamic)
+    for (int i = 0; i < M; i += TILE) {
+        for (int j = 0; j < N; j += TILE) {
+            int i_end = std::min(i + TILE, M);
+            int j_end = std::min(j + TILE, N);
+            for (int ii = i; ii < i_end; ++ii) {
+                for (int jj = j; jj < j_end; ++jj) {
+                    float sum = 0.0f;
+                    for (int kk = 0; kk < K; ++kk) {
+                        sum += A[ii * K + kk] * B[kk * N + jj];
+                    }
+                    C[ii * N + jj] += sum;
+                }
+            }
+        }
+    }
+
     return xeCudaSuccess;
 }
 

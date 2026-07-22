@@ -60,23 +60,41 @@ xeCudaError_t xeCudaLaunchKernel(KernelFunc kernel, xeDim3 grid, xeDim3 block, s
     (void)sharedMem;
     (void)stream;
 
-#pragma omp parallel for collapse(3) schedule(dynamic) if(grid.x * grid.y * grid.z > 1)
-    for (unsigned int gz = 0; gz < grid.z; ++gz) {
-        for (unsigned int gy = 0; gy < grid.y; ++gy) {
-            for (unsigned int gx = 0; gx < grid.x; ++gx) {
-                for (unsigned int bz = 0; bz < block.z; ++bz) {
-                    for (unsigned int by = 0; by < block.y; ++by) {
-                        for (unsigned int bx = 0; bx < block.x; ++bx) {
-                            g_xeWorkContext.gridDim = grid;
-                            g_xeWorkContext.blockDim = block;
-                            g_xeWorkContext.blockIdx = xeDim3(gx, gy, gz);
-                            g_xeWorkContext.threadIdx = xeDim3(bx, by, bz);
+    unsigned long long totalThreads = (unsigned long long)grid.x * grid.y * grid.z * block.x * block.y * block.z;
 
-                            kernel(args...);
-                        }
-                    }
-                }
-            }
+    if (totalThreads <= 1) {
+        // Single-thread fallback: no OpenMP overhead
+        g_xeWorkContext.gridDim = grid;
+        g_xeWorkContext.blockDim = block;
+        g_xeWorkContext.blockIdx = xeDim3(0, 0, 0);
+        g_xeWorkContext.threadIdx = xeDim3(0, 0, 0);
+        kernel(args...);
+    } else {
+        // Each OpenMP thread processes one (grid, block) work-item
+        // Flatten all thread indices into a single loop for correct collapse
+        const unsigned int gx_max = grid.x;
+        const unsigned int gy_max = grid.y;
+        const unsigned int gz_max = grid.z;
+        const unsigned int bx_max = block.x;
+        const unsigned int by_max = block.y;
+        const unsigned int bz_max = block.z;
+        const unsigned long long flat_max = (unsigned long long)gx_max * gy_max * gz_max * bx_max * by_max * bz_max;
+
+#pragma omp parallel for schedule(dynamic)
+        for (unsigned long long flat = 0; flat < flat_max; ++flat) {
+            unsigned int bx = flat % bx_max;
+            unsigned int by = (flat / bx_max) % by_max;
+            unsigned int bz = (flat / (bx_max * by_max)) % bz_max;
+            unsigned int gx = (flat / (bx_max * by_max * bz_max)) % gx_max;
+            unsigned int gy = (flat / (bx_max * by_max * bz_max * gx_max)) % gy_max;
+            unsigned int gz = (flat / (bx_max * by_max * bz_max * gx_max * gy_max)) % gz_max;
+
+            g_xeWorkContext.gridDim = grid;
+            g_xeWorkContext.blockDim = block;
+            g_xeWorkContext.blockIdx = xeDim3(gx, gy, gz);
+            g_xeWorkContext.threadIdx = xeDim3(bx, by, bz);
+
+            kernel(args...);
         }
     }
     return xeCudaSuccess;

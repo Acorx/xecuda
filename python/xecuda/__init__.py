@@ -24,3 +24,6 @@ def get_hardware_info():
 
 from .torch_bridge import init_torch_cuda_bridge
 from .inference import IntelArcInferenceEngine
+from .device import XeCudaDevice
+from .kernels import vector_add, sgemm, matvec_q4km, benchmark_bandwidth
+from .autograd import Tensor, Adam

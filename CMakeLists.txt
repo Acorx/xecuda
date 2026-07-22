@@ -6,10 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(include)
 
-# Source files
+# Source files — all translation units
 set(XECUDA_SOURCES
     src/xecuda_runtime.cpp
     src/xecuda_blas.cpp
+    src/xecuda_xmx.cpp
+    src/xecuda_l0.cpp
+    src/xecuda_stream.cpp
 )
 
 # OpenMP for parallel multi-threading emulation

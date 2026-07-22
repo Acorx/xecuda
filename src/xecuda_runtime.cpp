@@ -126,7 +126,8 @@ xeCudaError_t xeCudaMemcpyAsync(void* dst, const void* src, size_t count, xeCuda
 
 xeCudaError_t xeCudaStreamCreate(xeCudaStream_t* pStream) {
     if (!pStream) return xeCudaErrorInvalidValue;
-    xeCudaStream_st* s = new xeCudaStream_st{1};
+    static int nextStreamId = 1;
+    xeCudaStream_st* s = new xeCudaStream_st{nextStreamId++};
     *pStream = s;
     return xeCudaSuccess;
 }
