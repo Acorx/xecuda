@@ -1,0 +1,24 @@
+# XeCUDA Compilation Artifacts
+build/
+*.exe
+*.obj
+*.o
+*.lib
+*.dll
+*.pdb
+
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.egg-info/
+dist/
+*.whl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

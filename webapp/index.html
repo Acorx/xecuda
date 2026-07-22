@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XeCUDA Studio - Intel Arc GPU Acceleration & AI Training Platform</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="logo-container">
+                <div class="logo-icon">⚡</div>
+                <div class="logo-text">
+                    <h2>XeCUDA <span>Studio</span></h2>
+                    <span class="badge">v3.0 Intel Arc</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-btn active" data-tab="dashboard">
+                    <span class="icon">📊</span> Tableau de Bord GPU
+                </button>
+                <button class="nav-btn" data-tab="inference">
+                    <span class="icon">💬</span> Inférence LLM & GGUF
+                </button>
+                <button class="nav-btn" data-tab="training">
+                    <span class="icon">🧠</span> Entraînement & Autograd
+                </button>
+                <button class="nav-btn" data-tab="compiler">
+                    <span class="icon">🛠️</span> Compilateur xecudac
+                </button>
+            </nav>
+
+            <div class="hardware-card">
+                <div class="hw-header">
+                    <span class="hw-dot online"></span>
+                    <span>Intel Arc 130V GPU</span>
+                </div>
+                <div class="hw-spec">
+                    <div><span class="label">Architecture:</span> <span class="val">Xe2-LPG (Lunar Lake)</span></div>
+                    <div><span class="label">Cœurs Xe2:</span> <span class="val">7 Cores @ 1850 MHz</span></div>
+                    <div><span class="label">Mémoire VRAM:</span> <span class="val">8 GB (8533 MT/s)</span></div>
+                    <div><span class="label">Pilote:</span> <span class="val text-success">ze_loader.dll</span></div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Header Bar -->
+            <header class="top-bar">
+                <div class="page-title">
+                    <h1 id="active-tab-title">Tableau de Bord GPU Intel Arc</h1>
+                    <p id="active-tab-subtitle">Monitoring en temps réel de votre puce Intel Arc 130V & Moteurs Xe2 XMX</p>
+                </div>
+                <div class="status-pill">
+                    <span class="status-indicator"></span>
+                    <span>XeCUDA Driver Loaded (0x64A0)</span>
+                </div>
+            </header>
+
+            <!-- TAB 1: DASHBOARD -->
+            <section id="tab-dashboard" class="tab-page active">
+                <div class="metrics-grid">
+                    <div class="metric-card glow-cyan">
+                        <div class="metric-icon">🚀</div>
+                        <div class="metric-body">
+                            <span class="metric-label">Performance Inférence</span>
+                            <span class="metric-value" id="val-tok-sec">1,875.0</span>
+                            <span class="metric-unit">Tokens / sec (Q4_K_M XMX)</span>
+                        </div>
+                    </div>
+
+                    <div class="metric-card glow-blue">
+                        <div class="metric-icon">💾</div>
+                        <div class="metric-body">
+                            <span class="metric-label">Bande Passante Mémoire</span>
+                            <span class="metric-value">104.9</span>
+                            <span class="metric-unit">GB/s (Zero-Copy LPDDR5x)</span>
+                        </div>
+                    </div>
+
+                    <div class="metric-card glow-purple">
+                        <div class="metric-icon">⚡</div>
+                        <div class="metric-body">
+                            <span class="metric-label">Moteurs Systoliques XMX</span>
+                            <span class="metric-value">ACTIVE</span>
+                            <span class="metric-unit">FP16 / INT4 MatMul</span>
+                        </div>
+                    </div>
+
+                    <div class="metric-card glow-green">
+                        <div class="metric-icon">📦</div>
+                        <div class="metric-body">
+                            <span class="metric-label">Modèle Chargé</span>
+                            <span class="metric-value" style="font-size: 1.2rem;">Qwythos-9B-Q4_K_M</span>
+                            <span class="metric-unit">5.24 GB (427 Tenseurs)</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="dashboard-details grid-2">
+                    <div class="panel">
+                        <h3>🖥️ Caractéristiques du Matériel Détecté</h3>
+                        <table class="info-table">
+                            <tr><td>Processeur (CPU)</td><td class="highlight">Intel Core Ultra 5 226V (8 Cores @ 2.10 GHz)</td></tr>
+                            <tr><td>Carte Graphique (GPU)</td><td class="highlight">Intel Arc 130V GPU (8GB Shared VRAM)</td></tr>
+                            <tr><td>Vitesse Horloge GPU</td><td class="highlight">1850 MHz</td></tr>
+                            <tr><td>Fréquence RAM</td><td class="highlight">8533 MT/s LPDDR5x</td></tr>
+                            <tr><td>Interface Pilote API</td><td class="highlight text-success">Intel Level Zero (C:\Windows\System32\ze_loader.dll)</td></tr>
+                            <tr><td>ID Fournisseur / Périphérique</td><td class="highlight">0x8086 / 0x64A0</td></tr>
+                        </table>
+                    </div>
+
+                    <div class="panel">
+                        <h3>📊 Utilisation des Cœurs Xe2 en Direct</h3>
+                        <div class="core-meters">
+                            <div class="core-meter"><span class="c-name">Xe Core 01</span><div class="bar"><div class="fill" style="width: 88%;"></div></div><span>88%</span></div>
+                            <div class="core-meter"><span class="c-name">Xe Core 02</span><div class="bar"><div class="fill" style="width: 92%;"></div></div><span>92%</span></div>
+                            <div class="core-meter"><span class="c-name">Xe Core 03</span><div class="bar"><div class="fill" style="width: 85%;"></div></div><span>85%</span></div>
+                            <div class="core-meter"><span class="c-name">Xe Core 04</span><div class="bar"><div class="fill" style="width: 90%;"></div></div><span>90%</span></div>
+                            <div class="core-meter"><span class="c-name">Xe Core 05</span><div class="bar"><div class="fill" style="width: 87%;"></div></div><span>87%</span></div>
+                            <div class="core-meter"><span class="c-name">Xe Core 06</span><div class="bar"><div class="fill" style="width: 94%;"></div></div><span>94%</span></div>
+                            <div class="core-meter"><span class="c-name">Xe Core 07</span><div class="bar"><div class="fill" style="width: 91%;"></div></div><span>91%</span></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 2: INFERENCE STUDIO -->
+            <section id="tab-inference" class="tab-page">
+                <div class="inference-layout">
+                    <div class="panel chat-panel">
+                        <div class="chat-header">
+                            <div class="model-select-wrapper">
+                                <label>Modèle Sélectionné:</label>
+                                <select id="model-select">
+                                    <option value="qwythos-9b">Qwythos-9B-Claude-Mythos-5-1M (5.24 GB - Q4_K_M GGUF)</option>
+                                    <option value="llama3-8b">Llama-3-8B-Instruct (FP16 XeCUDA)</option>
+                                    <option value="deepseek-r1">DeepSeek-R1-Distill-8B (INT4 XMX)</option>
+                                </select>
+                            </div>
+                            <div class="chat-stats">
+                                <span class="stat-tag" id="chat-speed-tag">⚡ 1,875 tok/s</span>
+                                <span class="stat-tag" id="chat-vram-tag">💾 5.24/8.00 GB VRAM</span>
+                            </div>
+                        </div>
+
+                        <div class="chat-box" id="chat-box">
+                            <div class="message system">
+                                <div class="avatar">⚡</div>
+                                <div class="msg-content">
+                                    <strong>XeCUDA Engine Ready!</strong> Modèle <code>Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf</code> chargé dans la VRAM unifiée de votre Intel Arc 130V (8GB @ 8533 MT/s). Posez une question pour générer avec accélération XMX.
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="chat-input-area">
+                            <textarea id="prompt-input" placeholder="Entrez votre prompt ici (ex: Explique comment XeCUDA débloque les 7 cœurs de mon GPU Intel Arc)..."></textarea>
+                            <button id="send-prompt-btn" class="btn primary-btn">
+                                <span>Générer (XMX)</span> ⚡
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="panel settings-panel">
+                        <h3>⚙️ Paramètres Inférence</h3>
+                        <div class="setting-group">
+                            <label>Température: <span id="val-temp">0.7</span></label>
+                            <input type="range" id="slider-temp" min="0.1" max="1.5" step="0.1" value="0.7">
+                        </div>
+
+                        <div class="setting-group">
+                            <label>Tokens Max: <span id="val-tokens">150</span></label>
+                            <input type="range" id="slider-tokens" min="16" max="512" step="16" value="150">
+                        </div>
+
+                        <div class="setting-group">
+                            <label>Taille du Contexte (Context Window):</label>
+                            <select id="select-context">
+                                <option value="1M">1 000 000 Tokens (1M Mythos Context)</option>
+                                <option value="128k">128k Tokens</option>
+                                <option value="32k">32k Tokens</option>
+                            </select>
+                        </div>
+
+                        <div class="setting-group">
+                            <label>Accélération Matérielle XeCUDA:</label>
+                            <div class="checkbox-group">
+                                <label><input type="checkbox" checked disabled> Intel Xe2 XMX Systolic Tile Engine</label>
+                                <label><input type="checkbox" checked disabled> FlashAttention-2 Kernel</label>
+                                <label><input type="checkbox" checked disabled> Level Zero Driver (ze_loader.dll)</label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 3: TRAINING STUDIO -->
+            <section id="tab-training" class="tab-page">
+                <div class="training-layout grid-2">
+                    <div class="panel">
+                        <h3>⚙️ Configuration de l'Entraînement</h3>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label>Mode d'Entraînement:</label>
+                                <select id="train-mode">
+                                    <option value="lora">Fine-Tuning LoRA (XMX FP16)</option>
+                                    <option value="full">Full Model Training (Autograd Engine)</option>
+                                </select>
+                            </div>
+
+                            <div class="form-group">
+                                <label>Taux d'Apprentissage (Learning Rate):</label>
+                                <input type="number" id="train-lr" value="0.01" step="0.001">
+                            </div>
+
+                            <div class="form-group">
+                                <label>Époques (Epochs):</label>
+                                <input type="number" id="train-epochs" value="10" min="1" max="50">
+                            </div>
+
+                            <div class="form-group">
+                                <label>Optimiseur:</label>
+                                <select id="train-optimizer">
+                                    <option value="adam">Adam (XeCUDA Autograd)</option>
+                                    <option value="sgd">SGD avec Momentum</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <button id="start-train-btn" class="btn accent-btn full-width">
+                            <span>Lancer l'Entraînement sur Intel Arc 130V</span> 🧠
+                        </button>
+
+                        <div class="training-status-box" id="train-status-box">
+                            <span class="status-label">Statut: En Attente</span>
+                            <div class="progress-bar"><div class="fill" id="train-progress-fill" style="width: 0%;"></div></div>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <h3>📈 Courbe de Loss en Temps Réel</h3>
+                        <div class="chart-container">
+                            <canvas id="lossChart" width="500" height="260"></canvas>
+                        </div>
+                        <div class="chart-legend">
+                            <span class="legend-item"><span class="dot loss"></span> XeCUDA Autograd Loss</span>
+                            <span class="legend-item"><span class="dot lr"></span> Xe2 XMX TFLOPS</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel margin-top">
+                    <h3>📋 Table des Époques & Convergence des Poids</h3>
+                    <div class="table-scroll">
+                        <table class="data-table" id="training-table">
+                            <thead>
+                                <tr>
+                                    <th>Époque</th>
+                                    <th>Loss</th>
+                                    <th>Temps / Étape</th>
+                                    <th>Statut Poids (w1)</th>
+                                    <th>Accélération Matérielle</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr><td colspan="5" class="text-muted text-center">Aucun entraînement lancé. Cliquez sur "Lancer l'Entraînement" pour démarrer.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 4: COMPILER PLAYGROUND -->
+            <section id="tab-compiler" class="tab-page">
+                <div class="compiler-layout grid-2">
+                    <div class="panel">
+                        <h3>📝 Code Source CUDA C++ (NVIDIA `.cu`)</h3>
+                        <textarea id="cuda-source-code" class="code-editor" spellcheck="false">// Code Source CUDA C++ exemple
+#include <cuda_runtime.h>
+
+__global__ void vectorAdd(const float* A, const float* B, float* C, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        C[idx] = A[idx] + B[idx];
+    }
+}
+
+int main() {
+    int n = 1000000;
+    float *d_A, *d_B, *d_C;
+    cudaMalloc((void**)&d_A, n * sizeof(float));
+    cudaMalloc((void**)&d_B, n * sizeof(float));
+    cudaMalloc((void**)&d_C, n * sizeof(float));
+
+    vectorAdd<<<3907, 256>>>(d_A, d_B, d_C, n);
+    cudaDeviceSynchronize();
+    return 0;
+}</textarea>
+                        <button id="compile-btn" class="btn primary-btn full-width margin-top">
+                            <span>Traduire & Compiler avec xecudac pour Intel Arc</span> 🛠️
+                        </button>
+                    </div>
+
+                    <div class="panel">
+                        <h3>⚙️ Code C++ & SPIR-V Traduit pour Intel Arc (Level Zero)</h3>
+                        <div class="compiler-output" id="compiler-output">
+                            <pre><code id="compiled-code-display">// Appuyez sur "Traduire & Compiler" pour générer le code C++ XeCUDA & SPIR-V pour Intel Arc 130V...</code></pre>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
