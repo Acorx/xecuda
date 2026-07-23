@@ -509,17 +509,19 @@ __kernel void matvec_q6k(
         int x_off = blk * 256;
 
         for (int n = 0; n < 256; n += 128) {
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
             for (int l = 0; l < 32; l++) {
                 int is = l / 16;
                 int q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
                 int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
                 int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
                 int q4 = ((ql[l] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                sum += d * (float)sc[is]     * (float)q1 * x_local[x_off + n + l];
-                sum += d * (float)sc[is + 2] * (float)q2 * x_local[x_off + n + 32 + l];
-                sum += d * (float)sc[is + 4] * (float)q3 * x_local[x_off + n + 64 + l];
-                sum += d * (float)sc[is + 6] * (float)q4 * x_local[x_off + n + 96 + l];
+                s0 += d * (float)sc[is]     * (float)q1 * x_local[x_off + n + l];
+                s1 += d * (float)sc[is + 2] * (float)q2 * x_local[x_off + n + 32 + l];
+                s2 += d * (float)sc[is + 4] * (float)q3 * x_local[x_off + n + 64 + l];
+                s3 += d * (float)sc[is + 6] * (float)q4 * x_local[x_off + n + 96 + l];
             }
+            sum += s0 + s1 + s2 + s3;
             ql += 64;
             qh += 32;
             sc += 8;
@@ -1272,6 +1274,146 @@ def silu_f4(device, ptr_x, n):
 # ═══════════════════════════════════════════════════════════════════════
 
 # This is handled in the Python-side gqa_attention as a special case.
+
+# ═══════════════════════════════════════════════════════════════════════
+# add_writeback_norm: fused add residual + RMS norm with writeback
+# Replaces: add_inplace(dst += src) + rms_norm(dst → buf)
+# Writes: dst = dst + src; buf = rms_norm(dst)
+# Saves 1 kernel launch + 1 full-size buffer read per occurrence.
+# ═══════════════════════════════════════════════════════════════════════
+
+ADD_WRITEBACK_NORM_SRC = b"""
+__kernel void add_writeback_norm(
+    __global float* a,
+    __global const float* res,
+    __global const float* norm_w,
+    __global float* b,
+    const int n,
+    const float eps)
+{
+    int lid = get_local_id(0);
+    __local float lsum[256];
+    __local float inv_rms;
+
+    float sum = 0.0f;
+    for (int i = lid; i < n; i += 256) {
+        float v = a[i] + res[i];
+        a[i] = v;
+        sum += v * v;
+    }
+    lsum[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) lsum[lid] += lsum[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) inv_rms = 1.0f / sqrt(lsum[0] / (float)n + eps);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int i = lid; i < n; i += 256)
+        b[i] = a[i] * inv_rms * norm_w[i];
+}
+"""
+
+
+def add_writeback_norm(device, ptr_a, ptr_res, ptr_norm_w, ptr_b, n, eps=1e-6):
+    k = _get_kernel(device, "add_writeback_norm", ADD_WRITEBACK_NORM_SRC, b"add_writeback_norm")
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_a), ctypes.c_void_p(ptr_res),
+        ctypes.c_void_p(ptr_norm_w), ctypes.c_void_p(ptr_b),
+        ctypes.c_int32(n), ctypes.c_float(eps),
+    ])
+    gs = ((n + 255) // 256) * 256
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(gs)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        0, None, None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# rope_qk_norm: fused RoPE + Q-norm + K-norm for attn-only blocks
+# Replaces: rope_inplace + rms_norm(Q) + rms_norm(K) = 3 kernels → 1
+# ═══════════════════════════════════════════════════════════════════════
+
+ROPE_QK_NORM_SRC = b"""
+__kernel void rope_qk_norm(
+    __global float* q,
+    __global float* k,
+    __global const float* q_norm_w,
+    __global const float* k_norm_w,
+    const int head_dim,
+    const int n_heads,
+    const int n_kv_heads,
+    const int pos,
+    const float freq_base,
+    const float rope_factor,
+    const float eps)
+{
+    int idx = get_global_id(0);
+    int total_q = n_heads * head_dim;
+    int total_k = n_kv_heads * head_dim;
+
+    if (idx < total_q) {
+        int h = idx / head_dim;
+        int d = idx % head_dim;
+        int pair = d / 2;
+        float theta = (float)pos / pow(freq_base, (float)(2 * pair) / (float)head_dim);
+        theta /= rope_factor;
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        int base = h * head_dim + d;
+        float val = q[base];
+        float partner = q[h * head_dim + (d % 2 == 0 ? d + 1 : d - 1)];
+        if (d % 2 == 0)
+            q[base] = val * cos_t - partner * sin_t;
+        else
+            q[base] = val * cos_t + partner * sin_t;
+    }
+
+    if (idx < total_k) {
+        int h = idx / head_dim;
+        int d = idx % head_dim;
+        int pair = d / 2;
+        float theta = (float)pos / pow(freq_base, (float)(2 * pair) / (float)head_dim);
+        theta /= rope_factor;
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        int base = h * head_dim + d;
+        float val = k[base];
+        float partner = k[h * head_dim + (d % 2 == 0 ? d + 1 : d - 1)];
+        if (d % 2 == 0)
+            k[base] = val * cos_t - partner * sin_t;
+        else
+            k[base] = val * cos_t + partner * sin_t;
+    }
+}
+"""
+
+
+def rope_qk_norm(device, ptr_q, ptr_k, ptr_q_norm_w, ptr_k_norm_w,
+                  head_dim, n_heads, n_kv_heads, pos,
+                  freq_base=1e7, rope_factor=4.0, eps=1e-6):
+    k = _get_kernel(device, "rope_qk_norm", ROPE_QK_NORM_SRC, b"rope_qk_norm")
+    total = max(n_heads * head_dim, n_kv_heads * head_dim)
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_q), ctypes.c_void_p(ptr_k),
+        ctypes.c_void_p(ptr_q_norm_w), ctypes.c_void_p(ptr_k_norm_w),
+        ctypes.c_int32(head_dim), ctypes.c_int32(n_heads),
+        ctypes.c_int32(n_kv_heads), ctypes.c_int32(pos),
+        ctypes.c_float(freq_base), ctypes.c_float(rope_factor),
+        ctypes.c_float(eps),
+    ])
+    gs = ((total + 255) // 256) * 256
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(gs)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        0, None, None,
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Benchmark utility

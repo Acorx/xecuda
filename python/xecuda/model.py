@@ -100,10 +100,6 @@ class Model:
             else:
                 self._forward_attn_only(layer_idx, seq_pos)
 
-        self._norm_matvec("output_norm.weight", "output.weight",
-                          self.buf_a, self.buf_b,
-                          self._shape("output.weight")[1], D_MODEL)
-
         out_shape = self._shape("output.weight")
         vocab_size = out_shape[1]
 
@@ -112,6 +108,9 @@ class Model:
                 self.device.free(self.buf_logits)
             self.buf_logits = self.device.malloc(vocab_size * 4)
             self._logits_size = vocab_size
+
+        K.rms_norm(self.device, self.buf_a, self.buf_b,
+                   self._w("output_norm.weight"), 1, D_MODEL)
         self._matvec("output.weight", self.buf_b, self.buf_logits, vocab_size, out_shape[0])
 
         logits = np.empty(vocab_size, dtype=np.float32)
@@ -141,7 +140,6 @@ class Model:
         K.add_inplace(self.device, self.buf_a, self.buf_gate_out, D_MODEL)
 
         # FFN: norm → gate/up → swiglu → down → add
-        # (norm feeds 2 matvecs, keep separate)
         K.rms_norm(self.device, self.buf_a, self.buf_b,
                    self._w(f"blk.{li}.post_attention_norm.weight"), 1, D_MODEL)
         sh = s(f"blk.{li}.ffn_gate.weight")
