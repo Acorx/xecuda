@@ -7,6 +7,7 @@
 #include "../include/xecuda_ocl.h"
 #include <iostream>
 #include <cstring>
+#include <mutex>
 
 struct xeCublasContext {
     int activeDevice;
@@ -66,22 +67,24 @@ static cl_program  g_sgemmProg  = nullptr;
 static cl_kernel   g_sgemmKernel = nullptr;
 static cl_program  g_matvecProg = nullptr;
 static cl_kernel   g_matvecKernel = nullptr;
+static std::once_flag g_sgemmFlag;
+static std::once_flag g_matvecFlag;
 
 static bool ensureSgemmKernel() {
-    if (g_sgemmKernel) return true;
-    if (!xoc::isInitialized()) return false;
-    g_sgemmProg = xoc::gpuCompileProgram(SGEMM_SRC, std::strlen(SGEMM_SRC));
-    if (!g_sgemmProg) return false;
-    g_sgemmKernel = xoc::gpuCreateKernel(g_sgemmProg, "sgemm_cl");
+    std::call_once(g_sgemmFlag, []() {
+        if (!xoc::isInitialized()) return;
+        g_sgemmProg = xoc::gpuCompileProgram(SGEMM_SRC, std::strlen(SGEMM_SRC));
+        if (g_sgemmProg) g_sgemmKernel = xoc::gpuCreateKernel(g_sgemmProg, "sgemm_cl");
+    });
     return g_sgemmKernel != nullptr;
 }
 
 static bool ensureMatvecKernel() {
-    if (g_matvecKernel) return true;
-    if (!xoc::isInitialized()) return false;
-    g_matvecProg = xoc::gpuCompileProgram(MATVEC_SRC, std::strlen(MATVEC_SRC));
-    if (!g_matvecProg) return false;
-    g_matvecKernel = xoc::gpuCreateKernel(g_matvecProg, "matvec_cl");
+    std::call_once(g_matvecFlag, []() {
+        if (!xoc::isInitialized()) return;
+        g_matvecProg = xoc::gpuCompileProgram(MATVEC_SRC, std::strlen(MATVEC_SRC));
+        if (g_matvecProg) g_matvecKernel = xoc::gpuCreateKernel(g_matvecProg, "matvec_cl");
+    });
     return g_matvecKernel != nullptr;
 }
 
@@ -134,12 +137,9 @@ xeCudaError_t xeCublasSgemm(
 
     size_t gs[2] = { (size_t)((m + 15) / 16 * 16), (size_t)((n + 15) / 16 * 16) };
     size_t ls[2] = { 16, 16 };
-    cl_int err = xoc::func().EnqueueNDRangeKernel(
-        xoc::state().queue, g_sgemmKernel, 2, nullptr, gs, ls, 0, nullptr, nullptr
-    );
+    if (!xoc::gpuLaunch2D(g_sgemmKernel, gs, ls)) return xeCudaErrorInitializationError;
     xoc::gpuSync();
 
-    if (err != CL_SUCCESS) return xeCudaErrorInitializationError;
     return xeCudaSuccess;
 }
 
@@ -167,8 +167,10 @@ xeCudaError_t xeCudaMatVecQ4KM(
         return xeCudaErrorMemoryAllocation;
     }
 
-    xoc::gpuWrite(dQ4, q4_weights, sizeQ4);
-    xoc::gpuWrite(dX, x_in, sizeX);
+    if (!xoc::gpuWrite(dQ4, q4_weights, sizeQ4) || !xoc::gpuWrite(dX, x_in, sizeX)) {
+        xoc::gpuFree(dQ4); xoc::gpuFree(dX); xoc::gpuFree(dY);
+        return xeCudaErrorInvalidMemcpyDirection;
+    }
 
     cl_int rRows = rows, rCols = cols;
     xoc::gpuSetArg(g_matvecKernel, 0, sizeof(cl_mem), &dQ4);
@@ -181,7 +183,10 @@ xeCudaError_t xeCudaMatVecQ4KM(
     xoc::gpuLaunch(g_matvecKernel, gs, 256);
     xoc::gpuSync();
 
-    xoc::gpuRead(dY, y_out, sizeY);
+    if (!xoc::gpuRead(dY, y_out, sizeY)) {
+        xoc::gpuFree(dQ4); xoc::gpuFree(dX); xoc::gpuFree(dY);
+        return xeCudaErrorInvalidMemcpyDirection;
+    }
     xoc::gpuFree(dQ4);
     xoc::gpuFree(dX);
     xoc::gpuFree(dY);

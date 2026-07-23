@@ -26,6 +26,7 @@ xeCudaError_t xeXmxMultiplyAccumulate(
 ) {
     if (!tileA || !tileB || !tileC) return xeCudaErrorInvalidValue;
     if (!tileA->dataPtr || !tileB->dataPtr || !tileC->dataPtr) return xeCudaErrorInvalidValue;
+    if (tileA->cols != tileB->rows) return xeCudaErrorInvalidValue;
 
     const int M = tileA->rows;
     const int K = tileA->cols;
@@ -68,6 +69,7 @@ xeCudaError_t xeCudaFlashAttentionV2(
     int headDim
 ) {
     if (!Q || !K || !V || !O) return xeCudaErrorInvalidValue;
+    if (seqLen <= 0 || headDim <= 0 || batchSize <= 0 || numHeads <= 0) return xeCudaErrorInvalidValue;
 
     float scale = 1.0f / std::sqrt(static_cast<float>(headDim));
     const int TILE_SIZE = 64; // Block size for Intel Arc Xe2 L2 Cache

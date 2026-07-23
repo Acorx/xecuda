@@ -11,11 +11,14 @@ import time
 
 
 class IntelArcInferenceEngine:
-    def __init__(self, model_name="llama-3-8b-instruct", precision="fp16", model_path=None):
+    def __init__(self, model_name="llama-3-8b-instruct", precision="fp16",
+                 model_path=None, n_gpu_layers=0, stop_tokens=None):
         self.model_name = model_name
         self.precision = precision
         self.device = "GPU.0"
         self.model_path = model_path
+        self.n_gpu_layers = n_gpu_layers
+        self.stop_tokens = stop_tokens or ["</s>", "\n\n"]
         self._llm = None
         self._backend = None
 
@@ -26,16 +29,14 @@ class IntelArcInferenceEngine:
         """Loads model via best available backend on Intel Arc."""
         start_time = time.time()
 
-        # Try llama-cpp-python first (real GGUF inference)
         if self.model_path and os.path.isfile(self.model_path):
             try:
                 from llama_cpp import Llama
-                n_gpu_layers = 0  # CPU mode; set >0 if Metal/CUDA/GPU offload supported
                 self._llm = Llama(
                     model_path=self.model_path,
                     n_ctx=2048,
                     n_threads=os.cpu_count() or 4,
-                    n_gpu_layers=n_gpu_layers,
+                    n_gpu_layers=self.n_gpu_layers,
                     verbose=False,
                 )
                 self._backend = "llama-cpp-python"
@@ -47,7 +48,6 @@ class IntelArcInferenceEngine:
             except Exception as e:
                 print(f"[XeCUDA Inference] Failed to load model: {e}")
 
-        # Fallback: honest "no model" mode
         self._backend = None
         load_dur = time.time() - start_time
         print(f"[XeCUDA Inference] No GGUF model loaded ({load_dur:.2f}s).")
@@ -55,7 +55,7 @@ class IntelArcInferenceEngine:
         print(f"[XeCUDA Inference] Or install: pip install llama-cpp-python")
         return False
 
-    def generate(self, prompt, max_new_tokens=100, temperature=0.7):
+    def generate(self, prompt, max_new_tokens=100, temperature=0.7, stop=None):
         """Generates text using the loaded backend.
 
         Returns real model output if a GGUF model was loaded.
@@ -67,15 +67,20 @@ class IntelArcInferenceEngine:
                 f"Load a GGUF model first: engine = IntelArcInferenceEngine(model_path='path/to/model.gguf')"
             )
 
+        stop_tokens = stop or self.stop_tokens
+
         print(f"[XeCUDA Inference] Generating {max_new_tokens} tokens (temp={temperature})...")
         start = time.time()
 
-        output = self._llm(
-            prompt,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            stop=["</s>", "\n\n"],
-        )
+        try:
+            output = self._llm(
+                prompt,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                stop=stop_tokens,
+            )
+        except Exception as e:
+            return f"[XeCUDA Inference] Generation error: {e}"
 
         dur = time.time() - start
         text = output["choices"][0]["text"]

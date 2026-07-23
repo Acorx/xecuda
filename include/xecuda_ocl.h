@@ -51,6 +51,18 @@ typedef void*          cl_event;
 #define CL_PROGRAM_BUILD_LOG           0x1184
 
 // ============================================================================
+// Calling convention
+// ============================================================================
+
+#ifndef CL_API_CALL
+#ifdef _WIN32
+#define CL_API_CALL __stdcall
+#else
+#define CL_API_CALL
+#endif
+#endif
+
+// ============================================================================
 // OpenCL function pointer typedefs
 // ============================================================================
 
@@ -118,9 +130,13 @@ struct OCLFuncs {
     PFN_clReleaseContext        ReleaseContext;
 };
 
-static BackendState g_state = {};
-static OCLFuncs g_func = {};
-static HMODULE g_hCL = nullptr;
+inline BackendState g_state = {};
+inline OCLFuncs g_func = {};
+#ifdef _WIN32
+inline HMODULE g_hCL = nullptr;
+#else
+inline void* g_hCL = nullptr;
+#endif
 
 inline bool init() {
     if (g_state.initialized) return true;
@@ -176,22 +192,30 @@ inline bool init() {
     g_func.ReleaseContext        = (PFN_clReleaseContext)dlsym(g_hCL, "clReleaseContext");
 #endif
 
-    if (!g_func.GetPlatformIDs || !g_func.CreateContext) return false;
+    if (!g_func.GetPlatformIDs || !g_func.GetDeviceIDs || !g_func.GetDeviceInfo ||
+        !g_func.CreateContext || !g_func.CreateCommandQueue || !g_func.CreateBuffer ||
+        !g_func.CreateProgramWithSource || !g_func.BuildProgram || !g_func.GetProgramBuildInfo ||
+        !g_func.CreateKernel || !g_func.SetKernelArg || !g_func.EnqueueNDRangeKernel ||
+        !g_func.EnqueueWriteBuffer || !g_func.EnqueueReadBuffer || !g_func.Finish ||
+        !g_func.ReleaseMemObject || !g_func.ReleaseKernel || !g_func.ReleaseProgram ||
+        !g_func.ReleaseCommandQueue || !g_func.ReleaseContext) return false;
 
     cl_int err;
     cl_uint nPlat = 0;
-    g_func.GetPlatformIDs(0, nullptr, &nPlat);
-    if (nPlat == 0) return false;
+    err = g_func.GetPlatformIDs(0, nullptr, &nPlat);
+    if (err != CL_SUCCESS || nPlat == 0) return false;
     cl_platform_id* platforms = new cl_platform_id[nPlat];
-    g_func.GetPlatformIDs(nPlat, platforms, nullptr);
+    err = g_func.GetPlatformIDs(nPlat, platforms, nullptr);
+    if (err != CL_SUCCESS) { delete[] platforms; return false; }
     g_state.platform = platforms[0];
     delete[] platforms;
 
     cl_uint nDev = 0;
-    g_func.GetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, 0, nullptr, &nDev);
-    if (nDev == 0) return false;
+    err = g_func.GetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, 0, nullptr, &nDev);
+    if (err != CL_SUCCESS || nDev == 0) return false;
     cl_device_id* devs = new cl_device_id[nDev];
-    g_func.GetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, nDev, devs, nullptr);
+    err = g_func.GetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, nDev, devs, nullptr);
+    if (err != CL_SUCCESS) { delete[] devs; return false; }
     g_state.device = devs[0];
     delete[] devs;
 
@@ -276,12 +300,24 @@ inline bool gpuLaunch(cl_kernel kernel, size_t globalSize, size_t localSize) {
     return err == CL_SUCCESS;
 }
 
+inline bool gpuLaunch2D(cl_kernel kernel, const size_t gs[2], const size_t ls[2]) {
+    cl_int err = g_func.EnqueueNDRangeKernel(
+        g_state.queue, kernel, 2, nullptr, gs, ls, 0, nullptr, nullptr
+    );
+    return err == CL_SUCCESS;
+}
+
 inline void gpuReleaseKernel(cl_kernel k) { if (k) g_func.ReleaseKernel(k); }
 inline void gpuReleaseProgram(cl_program p) { if (p) g_func.ReleaseProgram(p); }
 
 inline void shutdown() {
     if (g_state.queue) { g_func.ReleaseCommandQueue(g_state.queue); g_state.queue = nullptr; }
     if (g_state.context) { g_func.ReleaseContext(g_state.context); g_state.context = nullptr; }
+#ifdef _WIN32
+    if (g_hCL) { FreeLibrary(g_hCL); g_hCL = nullptr; }
+#else
+    if (g_hCL) { dlclose(g_hCL); g_hCL = nullptr; }
+#endif
     g_state.initialized = false;
 }
 

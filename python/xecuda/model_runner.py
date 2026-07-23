@@ -19,7 +19,6 @@ What is NOT (yet) done here:
 import time
 import os
 import ctypes
-from ctypes import c_float
 from .device import XeCudaDevice
 from .gguf_loader import GGUFModelLoader
 from .kernels import matvec_q4km, benchmark_bandwidth
@@ -41,13 +40,11 @@ class XeCudaModelRunner:
         self.loader = GGUFModelLoader(model_path)
         self._d_input = None
         self._d_output = None
-        self.hidden_dim = 4096  # Qwen 3.5 / 9B architecture
+        self.hidden_dim = 4096
 
         info = self.device.info()
         print(f"[XeCUDA Runner] Device  : {info['gpu_name']}")
         print(f"[XeCUDA Runner] Driver  : {info['driver']}")
-        print(f"[XeCUDA Runner] DeviceID: {info['device_id']} | Clock: {info['clock_mhz']} MHz")
-        print(f"[XeCUDA Runner] USM Memory: zeMemAllocShared via ze_loader.dll")
 
     def load_to_vram(self):
         """Allocates real input/output buffers in GPU Unified Shared Memory."""
@@ -60,10 +57,9 @@ class XeCudaModelRunner:
         self._d_output = self.device.malloc(size_io)
         t1 = time.perf_counter()
 
-        # Initialize input vector in GPU USM memory
-        arr_in = (c_float * self.hidden_dim).from_address(self._d_input)
-        for i in range(self.hidden_dim):
-            arr_in[i] = 0.01 * (i % 256)
+        # Initialize input vector in GPU memory via proper write
+        arr_in = [0.01 * (i % 256) for i in range(self.hidden_dim)]
+        self.device.memcpy_h2d(self._d_input, arr_in)
 
         print(f"[XeCUDA VRAM] Input  ptr: 0x{self._d_input:X}")
         print(f"[XeCUDA VRAM] Output ptr: 0x{self._d_output:X}")
@@ -101,24 +97,29 @@ class XeCudaModelRunner:
 
     def run_full_inference(self, prompt: str = "", n_layers: int = 28) -> dict:
         """
-        Runs forward pass over n_layers Transformer blocks on real GPU USM memory.
+        Runs forward pass over n_layers Transformer blocks on real GPU memory.
         Reads real tensor data from GGUF binary file each layer.
         """
-        print(f"\n[XeCUDA Inference] Running {n_layers} layers on Intel Arc 130V USM memory...")
-        print(f"[XeCUDA Inference] Input vector  : 0x{self._d_input:X} (real GPU USM ptr)")
-        print(f"[XeCUDA Inference] Output vector : 0x{self._d_output:X} (real GPU USM ptr)")
+        if self._d_input is None or self._d_output is None:
+            print("[XeCUDA Inference] Error: load_to_vram() must be called first.")
+            return {"error": "Buffers not allocated"}
+
+        print(f"\n[XeCUDA Inference] Running {n_layers} layers on Intel Arc 130V...")
+        print(f"[XeCUDA Inference] Input vector  : 0x{self._d_input:X}")
+        print(f"[XeCUDA Inference] Output vector : 0x{self._d_output:X}")
         print(f"[XeCUDA Inference] Computation   : Q4_K_M matvec on real GGUF tensor bytes")
 
         total_ms = 0.0
         layer_times = []
 
         for i in range(n_layers):
-            ms = self.run_layer_forward(i % 42)
+            ms = self.run_layer_forward(i)
             total_ms += ms
             layer_times.append(ms)
             if i < 5 or i == n_layers - 1:
+                out_vals = self.device.memcpy_d2h(self._d_output, 1)
                 print(f"  Layer {i+1:02d}/{n_layers}: {ms:.2f}ms | "
-                      f"output[0]={c_float.from_address(self._d_output).value:.6f}")
+                      f"output[0]={out_vals[0]:.6f}")
 
         avg_ms = total_ms / n_layers if n_layers else 0
         print(f"\n[XeCUDA Inference] Total compute : {total_ms:.2f}ms")

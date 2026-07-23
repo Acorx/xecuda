@@ -7,19 +7,6 @@
 #include "../include/xecuda_ocl.h"
 #include <iostream>
 #include <cstring>
-#include <mutex>
-#include <vector>
-
-// ============================================================================
-// OpenCL-based Level Zero backend
-// ============================================================================
-// Level Zero and OpenCL are both supported by the Intel NEO driver.
-// This implementation maps L0 semantics onto real OpenCL API calls
-// so that the xecuda_l0.h API surface works with actual GPU dispatch.
-
-static std::vector<cl_program> g_l0Programs;
-static std::vector<cl_kernel> g_l0Kernels;
-static std::mutex g_l0Mutex;
 
 xeCudaError_t xeL0Init(xeL0State_t* state) {
     if (!state) return xeCudaErrorInvalidValue;
@@ -93,12 +80,7 @@ xeCudaError_t xeL0CreateModuleFromSpirv(
         return xeCudaErrorInitializationError;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_l0Mutex);
-        g_l0Programs.push_back(prog);
-        g_l0Kernels.push_back(kern);
-    }
-
+    // Caller owns these handles; caller must call xeL0ReleaseModule/Kernel when done.
     *module = (ze_module_handle_t)prog;
     *kernel = (ze_kernel_handle_t)kern;
 
@@ -131,14 +113,6 @@ xeCudaError_t xeL0LaunchKernel(
 
 xeCudaError_t xeL0Shutdown(xeL0State_t* state) {
     if (!state) return xeCudaErrorInvalidValue;
-
-    {
-        std::lock_guard<std::mutex> lock(g_l0Mutex);
-        for (cl_kernel k : g_l0Kernels) xoc::gpuReleaseKernel(k);
-        for (cl_program p : g_l0Programs) xoc::gpuReleaseProgram(p);
-        g_l0Kernels.clear();
-        g_l0Programs.clear();
-    }
 
     xoc::shutdown();
     state->initialized = 0;

@@ -9,6 +9,8 @@
 #include <iostream>
 #include <cstring>
 #include <mutex>
+#include <atomic>
+#include <mutex>
 #include <unordered_map>
 
 // Map GPU buffer handles (cl_mem) to sizes for correct memcpy/memset
@@ -20,7 +22,7 @@ thread_local xeWorkItemContext g_xeWorkContext = {
 };
 
 static int g_currentDevice = 0;
-static xeCudaError_t g_lastError = xeCudaSuccess;
+static std::atomic<xeCudaError_t> g_lastError{xeCudaSuccess};
 
 struct xeCudaStream_st {
     int streamId;
@@ -56,7 +58,6 @@ xeCudaError_t xeCudaGetDeviceProperties(xeCudaDeviceProp_t* prop, int device) {
     std::memset(prop, 0, sizeof(xeCudaDeviceProp_t));
     std::strncpy(prop->name, s.deviceName, sizeof(prop->name) - 1);
     prop->vendorId = 0x8086;
-    prop->deviceId = 0x64A0;
     prop->totalGlobalMem = s.globalMemBytes;
     prop->xeCores = s.computeUnits;
     prop->maxThreadsPerBlock = 1024;
@@ -66,10 +67,6 @@ xeCudaError_t xeCudaGetDeviceProperties(xeCudaDeviceProp_t* prop, int device) {
     prop->maxGridSize[0] = 2147483647;
     prop->maxGridSize[1] = 65535;
     prop->maxGridSize[2] = 65535;
-    prop->clockRateKHz = 1850000;
-    prop->memoryClockRateKHz = 8533000;
-    prop->memoryBusWidth = 128;
-    prop->l2CacheSize = 8 * 1024 * 1024;
     prop->isIntegrated = 1;
     prop->supportsXMX = 1;
     return xeCudaSuccess;
@@ -133,20 +130,19 @@ xeCudaError_t xeCudaMemset(void* devPtr, int value, size_t count) {
     if (!devPtr) return xeCudaErrorInvalidValue;
     if (!xoc::isInitialized()) return xeCudaErrorInitializationError;
 
-    // Build memset kernel on the fly
     static cl_program s_memsetProg = nullptr;
     static cl_kernel s_memsetKernel = nullptr;
-    if (!s_memsetProg) {
+    static std::once_flag s_memsetFlag;
+    std::call_once(s_memsetFlag, []() {
         const char* src =
             "__kernel void memset_fill(__global uint* buf, const uint val, const int N) {\n"
             "    int i = get_global_id(0);\n"
             "    if (i < N) buf[i] = val;\n"
             "}\n";
         s_memsetProg = xoc::gpuCompileProgram(src, std::strlen(src));
-        if (!s_memsetProg) return xeCudaErrorInitializationError;
-        s_memsetKernel = xoc::gpuCreateKernel(s_memsetProg, "memset_fill");
-        if (!s_memsetKernel) return xeCudaErrorInitializationError;
-    }
+        if (s_memsetProg) s_memsetKernel = xoc::gpuCreateKernel(s_memsetProg, "memset_fill");
+    });
+    if (!s_memsetKernel) return xeCudaErrorInitializationError;
 
     uint32_t fillVal = (uint32_t)(value & 0xFF) * 0x01010101u;
     uint32_t nWords = (uint32_t)(count / 4);
@@ -159,11 +155,12 @@ xeCudaError_t xeCudaMemset(void* devPtr, int value, size_t count) {
     size_t gs = ((nWords + 255) / 256) * 256;
     xoc::gpuLaunch(s_memsetKernel, gs, 256);
     xoc::gpuSync();
+
     return xeCudaSuccess;
 }
 
 xeCudaError_t xeCudaMemcpy(void* dst, const void* src, size_t count, xeCudaMemcpyKind kind) {
-    if (!dst && !src) return xeCudaErrorInvalidValue;
+    if (!dst || !src) return xeCudaErrorInvalidValue;
     if (!xoc::isInitialized()) return xeCudaErrorInitializationError;
 
     switch (kind) {
@@ -188,14 +185,16 @@ xeCudaError_t xeCudaMemcpy(void* dst, const void* src, size_t count, xeCudaMemcp
         std::memcpy(dst, src, count);
         break;
     default:
-        std::memcpy(dst, src, count);
-        break;
+        g_lastError = xeCudaErrorInvalidMemcpyDirection;
+        return xeCudaErrorInvalidMemcpyDirection;
     }
     return xeCudaSuccess;
 }
 
 xeCudaError_t xeCudaMemcpyAsync(void* dst, const void* src, size_t count, xeCudaMemcpyKind kind, xeCudaStream_t stream) {
     (void)stream;
+    // OpenCL: all operations are already in-order on the single queue.
+    // True async requires per-stream queues + events — not yet implemented.
     return xeCudaMemcpy(dst, src, count, kind);
 }
 
@@ -240,7 +239,5 @@ const char* xeCudaGetErrorString(xeCudaError_t error) {
 }
 
 xeCudaError_t xeCudaGetLastError(void) {
-    xeCudaError_t err = g_lastError;
-    g_lastError = xeCudaSuccess;
-    return err;
+    return g_lastError.exchange(xeCudaSuccess);
 }

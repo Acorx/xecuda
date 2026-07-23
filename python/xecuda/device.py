@@ -33,6 +33,7 @@ class XeCudaDevice:
         self._ocl.clCreateCommandQueueWithProperties.restype = ctypes.c_void_p
 
         self._programs = {}
+        self._kernels = {}
         self._buffers = []
         self.initialized = False
         self._init()
@@ -164,16 +165,20 @@ __kernel void memset_fill(__global uint* buf, const uint val, const int N) {
         return prog
 
     def build_kernel(self, kernel_name: str, source: bytes, func_name: bytes) -> ctypes.c_void_p:
-        """Compile and return an OpenCL kernel."""
+        """Compile and return an OpenCL kernel (cached)."""
+        key = (kernel_name, func_name)
+        if key in self._kernels:
+            return self._kernels[key]
         prog = self._get_program(kernel_name, source)
         err = ctypes.c_int32(0)
         k = _P(self._ocl.clCreateKernel(prog, func_name, ctypes.byref(err)))
         if err.value != 0:
             raise RuntimeError(f"[XeCUDA] clCreateKernel('{func_name.decode()}') failed: {err.value}")
+        self._kernels[key] = k
         return k
 
     def enqueue_kernel(self, kernel, global_size, local_size, args):
-        """Launch an OpenCL kernel with the given arguments."""
+        """Launch an OpenCL kernel (1D) with the given arguments."""
         for i, arg in enumerate(args):
             if isinstance(arg, int):
                 val = ctypes.c_void_p(arg)
@@ -191,6 +196,28 @@ __kernel void memset_fill(__global uint* buf, const uint val, const int N) {
         self._ocl.clEnqueueNDRangeKernel(
             self._queue, kernel, 1, None,
             ctypes.pointer(gs), ctypes.pointer(ls), 0, None, None
+        )
+
+    def enqueue_kernel_2d(self, kernel, global_sizes, local_sizes, args):
+        """Launch an OpenCL kernel (2D) with the given arguments."""
+        for i, arg in enumerate(args):
+            if isinstance(arg, int):
+                val = ctypes.c_void_p(arg)
+                self._ocl.clSetKernelArg(kernel, i, ctypes.sizeof(val), ctypes.pointer(val))
+            elif isinstance(arg, ctypes.c_int32):
+                self._ocl.clSetKernelArg(kernel, i, 4, ctypes.pointer(arg))
+            elif isinstance(arg, ctypes.c_float):
+                self._ocl.clSetKernelArg(kernel, i, 4, ctypes.pointer(arg))
+            elif isinstance(arg, ctypes.c_void_p):
+                self._ocl.clSetKernelArg(kernel, i, ctypes.sizeof(arg), ctypes.pointer(arg))
+            else:
+                raise TypeError(f"Unsupported arg type: {type(arg)}")
+        gs = (ctypes.c_size_t * 2)(*global_sizes)
+        ls = (ctypes.c_size_t * 2)(*local_sizes)
+        self._ocl.clEnqueueNDRangeKernel(
+            self._queue, kernel, 2, None,
+            ctypes.cast(gs, ctypes.POINTER(ctypes.c_size_t)),
+            ctypes.cast(ls, ctypes.POINTER(ctypes.c_size_t)), 0, None, None
         )
 
     def finish(self):

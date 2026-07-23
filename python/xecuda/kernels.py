@@ -1,6 +1,6 @@
 """
 XeCUDA GPU Kernels — Real OpenCL dispatch on Intel Arc 130V
-===========================================================
+==========================================================
 ALL computation runs on the actual GPU via OpenCL kernel dispatch.
 No NumPy fallback. No CPU simulation. Real GPU compute.
 """
@@ -67,10 +67,23 @@ __kernel void matvec_q4km(
 }
 """
 
+# Kernel handle cache: (device_id, kernel_name) -> kernel handle
+_kernel_cache = {}
+
+
+def _get_cached_kernel(device: XeCudaDevice, cache_key: str, source: bytes, func_name: bytes):
+    """Get a cached kernel handle, avoiding repeated clCreateKernel calls."""
+    key = (id(device), cache_key)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    k = device.build_kernel(cache_key, source, func_name)
+    _kernel_cache[key] = k
+    return k
+
 
 def vector_add(device: XeCudaDevice, ptr_a: int, ptr_b: int, ptr_c: int, n: int):
     """Vector addition C = A + B — dispatched to Intel Arc GPU via OpenCL."""
-    k = device.build_kernel("vec_add", VEC_ADD_SRC, b"vector_add")
+    k = _get_cached_kernel(device, "vec_add", VEC_ADD_SRC, b"vector_add")
     bufA = ctypes.c_void_p(ptr_a)
     bufB = ctypes.c_void_p(ptr_b)
     bufC = ctypes.c_void_p(ptr_c)
@@ -82,8 +95,8 @@ def vector_add(device: XeCudaDevice, ptr_a: int, ptr_b: int, ptr_c: int, n: int)
 
 def sgemm(device: XeCudaDevice, ptr_a: int, ptr_b: int, ptr_c: int,
           M: int, N: int, K: int, alpha: float = 1.0, beta: float = 0.0):
-    """SGEMM C = alpha*A*B + beta*C — dispatched to Intel Arc GPU via OpenCL."""
-    k = device.build_kernel("sgemm", SGEMM_SRC, b"sgemm")
+    """SGEMM C = alpha*A*B + beta*C — 2D dispatch to Intel Arc GPU via OpenCL."""
+    k = _get_cached_kernel(device, "sgemm", SGEMM_SRC, b"sgemm")
     bufA = ctypes.c_void_p(ptr_a)
     bufB = ctypes.c_void_p(ptr_b)
     bufC = ctypes.c_void_p(ptr_c)
@@ -92,7 +105,7 @@ def sgemm(device: XeCudaDevice, ptr_a: int, ptr_b: int, ptr_c: int,
         bufA, bufB, bufC,
         ctypes.c_float(alpha), ctypes.c_float(beta)
     ]
-    device.enqueue_kernel(k, max(M, N), 16, args)
+    device.enqueue_kernel_2d(k, ((M + 15) // 16 * 16, (N + 15) // 16 * 16), (16, 16), args)
     device.finish()
     return ptr_c
 
@@ -106,16 +119,18 @@ def matvec_q4km(device: XeCudaDevice, q4_bytes: bytes, ptr_x: int, ptr_y: int,
         raise ValueError(f"matvec_q4km: need {needed} bytes, got {len(q4_bytes)}")
 
     ptr_q4 = device.malloc(needed)
-    device.write_buffer(ptr_q4, (ctypes.c_ubyte * needed)(*q4_bytes[:needed]), needed)
+    try:
+        device.write_buffer(ptr_q4, (ctypes.c_ubyte * needed)(*q4_bytes[:needed]), needed)
 
-    k = device.build_kernel("matvec_q4km", MATVEC_Q4_SRC, b"matvec_q4km")
-    buf_q4 = ctypes.c_void_p(ptr_q4)
-    buf_x = ctypes.c_void_p(ptr_x)
-    buf_y = ctypes.c_void_p(ptr_y)
-    device.enqueue_kernel(k, (rows + 255) // 256 * 256, 256,
-                          [buf_q4, buf_x, buf_y, ctypes.c_int32(rows), ctypes.c_int32(cols)])
-    device.finish()
-    device.free(ptr_q4)
+        k = _get_cached_kernel(device, "matvec_q4km", MATVEC_Q4_SRC, b"matvec_q4km")
+        buf_q4 = ctypes.c_void_p(ptr_q4)
+        buf_x = ctypes.c_void_p(ptr_x)
+        buf_y = ctypes.c_void_p(ptr_y)
+        device.enqueue_kernel(k, (rows + 255) // 256 * 256, 256,
+                              [buf_q4, buf_x, buf_y, ctypes.c_int32(rows), ctypes.c_int32(cols)])
+        device.finish()
+    finally:
+        device.free(ptr_q4)
     return ptr_y
 
 

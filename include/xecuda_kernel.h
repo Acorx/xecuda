@@ -16,6 +16,8 @@ struct xeDim3 {
 typedef struct xeDim3 xeDim3;
 
 // CUDA Qualifier Shims
+// NOTE: __shared__ maps to thread_local (each thread gets a private copy).
+// True shared memory (block-shared) is not yet supported on the CPU emulation path.
 #ifndef __global__
 #define __global__
 #endif
