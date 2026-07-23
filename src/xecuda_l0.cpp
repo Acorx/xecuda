@@ -1,42 +1,69 @@
 /**
  * @file xecuda_l0.cpp
- * @brief Level Zero Bare-Metal Driver Implementation for Intel Arc GPUs
+ * @brief Level Zero Driver Backend — Real GPU dispatch via OpenCL
  */
 
 #include "../include/xecuda_l0.h"
+#include "../include/xecuda_ocl.h"
 #include <iostream>
 #include <cstring>
-#include <cstdlib>
+#include <mutex>
+#include <vector>
+
+// ============================================================================
+// OpenCL-based Level Zero backend
+// ============================================================================
+// Level Zero and OpenCL are both supported by the Intel NEO driver.
+// This implementation maps L0 semantics onto real OpenCL API calls
+// so that the xecuda_l0.h API surface works with actual GPU dispatch.
+
+static std::vector<cl_program> g_l0Programs;
+static std::vector<cl_kernel> g_l0Kernels;
+static std::mutex g_l0Mutex;
 
 xeCudaError_t xeL0Init(xeL0State_t* state) {
     if (!state) return xeCudaErrorInvalidValue;
 
     std::memset(state, 0, sizeof(xeL0State_t));
-    state->initialized = 1;
-    state->driver = (ze_driver_handle_t)0x1001;
-    state->device = (ze_device_handle_t)0x2002;
-    state->context = (ze_context_handle_t)0x3003;
-    state->commandQueue = (ze_command_queue_handle_t)0x4004;
-    state->commandList = (ze_command_list_handle_t)0x5005;
-    state->deviceId = 0x64A0; // Intel Arc 130V Device ID
-    std::strncpy(state->deviceName, "Intel(R) Arc(TM) 130V GPU (Level Zero Driver)", sizeof(state->deviceName) - 1);
 
-    std::cout << "[XeCUDA L0 Driver] Level Zero Bare-Metal Backend Initialized." << std::endl;
-    std::cout << "                   Target: " << state->deviceName << " (Device ID: 0x" << std::hex << state->deviceId << std::dec << ")" << std::endl;
+    if (!xoc::isInitialized() && !xoc::init()) {
+        std::cerr << "[XeCUDA L0] Failed to initialize OpenCL backend." << std::endl;
+        return xeCudaErrorInitializationError;
+    }
+
+    const auto& s = xoc::state();
+
+    state->initialized = 1;
+    state->driver = (ze_driver_handle_t)1;
+    state->device = (ze_device_handle_t)2;
+    state->context = (ze_context_handle_t)3;
+    state->commandQueue = (ze_command_queue_handle_t)4;
+    state->commandList = (ze_command_list_handle_t)5;
+    state->deviceId = 0x64A0;
+    std::strncpy(state->deviceName, s.deviceName, sizeof(state->deviceName) - 1);
+
+    std::cout << "[XeCUDA L0] Real GPU backend via OpenCL 3.0 Intel NEO." << std::endl;
+    std::cout << "            Device: " << s.deviceName << " (" << s.computeUnits << " CU)" << std::endl;
+    std::cout << "            VRAM: " << (s.globalMemBytes / (1024ULL * 1024ULL)) << " MB" << std::endl;
 
     return xeCudaSuccess;
 }
 
 xeCudaError_t xeL0AllocSharedMemory(xeL0State_t* state, size_t size, void** ptr) {
     if (!state || !state->initialized || !ptr || size == 0) return xeCudaErrorInvalidValue;
+    if (!xoc::isInitialized()) return xeCudaErrorInitializationError;
 
-    // Allocate 64-byte aligned Zero-Copy USM memory
-    return xeCudaMalloc(ptr, size);
+    cl_mem buf = xoc::gpuMalloc(size);
+    if (!buf) return xeCudaErrorMemoryAllocation;
+
+    *ptr = buf;
+    return xeCudaSuccess;
 }
 
 xeCudaError_t xeL0FreeMemory(xeL0State_t* state, void* ptr) {
     if (!state || !state->initialized) return xeCudaErrorInvalidValue;
-    return xeCudaFree(ptr);
+    xoc::gpuFree((cl_mem)ptr);
+    return xeCudaSuccess;
 }
 
 xeCudaError_t xeL0CreateModuleFromSpirv(
@@ -50,11 +77,33 @@ xeCudaError_t xeL0CreateModuleFromSpirv(
     if (!state || !state->initialized || !spirvCode || spirvSize == 0 || !kernelName || !module || !kernel) {
         return xeCudaErrorInvalidValue;
     }
+    if (!xoc::isInitialized()) return xeCudaErrorInitializationError;
 
-    *module = (ze_module_handle_t)0x7007;
-    *kernel = (ze_kernel_handle_t)0x8008;
+    // The spirvCode is actually OpenCL C source text (from xecudac translator)
+    cl_program prog = xoc::gpuCompileProgram((const char*)spirvCode, spirvSize);
+    if (!prog) {
+        std::cerr << "[XeCUDA L0] Kernel build failed for '" << kernelName << "'" << std::endl;
+        return xeCudaErrorInitializationError;
+    }
 
-    std::cout << "[XeCUDA L0 Driver] Compiled SPIR-V Module (" << spirvSize << " bytes) for Kernel '" << kernelName << "'." << std::endl;
+    cl_kernel kern = xoc::gpuCreateKernel(prog, kernelName);
+    if (!kern) {
+        xoc::gpuReleaseProgram(prog);
+        std::cerr << "[XeCUDA L0] clCreateKernel failed for '" << kernelName << "'" << std::endl;
+        return xeCudaErrorInitializationError;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_l0Mutex);
+        g_l0Programs.push_back(prog);
+        g_l0Kernels.push_back(kern);
+    }
+
+    *module = (ze_module_handle_t)prog;
+    *kernel = (ze_kernel_handle_t)kern;
+
+    std::cout << "[XeCUDA L0] Compiled and loaded kernel '" << kernelName
+              << "' (" << spirvSize << " bytes source)" << std::endl;
     return xeCudaSuccess;
 }
 
@@ -65,17 +114,34 @@ xeCudaError_t xeL0LaunchKernel(
     uint32_t groupSizeX, uint32_t groupSizeY, uint32_t groupSizeZ
 ) {
     if (!state || !state->initialized || !kernel) return xeCudaErrorInvalidValue;
+    if (!xoc::isInitialized()) return xeCudaErrorInitializationError;
 
-    // Level Zero Low-Latency Dispatch Simulation
-    (void)groupCountX; (void)groupCountY; (void)groupCountZ;
-    (void)groupSizeX; (void)groupSizeY; (void)groupSizeZ;
+    // 1D launch: flatten all groups
+    size_t globalSize = (size_t)groupCountX * groupSizeX;
+    size_t localSize = (size_t)groupSizeX;
+
+    cl_kernel kern = (cl_kernel)kernel;
+    if (!xoc::gpuLaunch(kern, globalSize, localSize)) {
+        return xeCudaErrorInitializationError;
+    }
+    xoc::gpuSync();
 
     return xeCudaSuccess;
 }
 
 xeCudaError_t xeL0Shutdown(xeL0State_t* state) {
     if (!state) return xeCudaErrorInvalidValue;
+
+    {
+        std::lock_guard<std::mutex> lock(g_l0Mutex);
+        for (cl_kernel k : g_l0Kernels) xoc::gpuReleaseKernel(k);
+        for (cl_program p : g_l0Programs) xoc::gpuReleaseProgram(p);
+        g_l0Kernels.clear();
+        g_l0Programs.clear();
+    }
+
+    xoc::shutdown();
     state->initialized = 0;
-    std::cout << "[XeCUDA L0 Driver] Level Zero Driver Backend Shutdown." << std::endl;
+    std::cout << "[XeCUDA L0] GPU backend shutdown complete." << std::endl;
     return xeCudaSuccess;
 }

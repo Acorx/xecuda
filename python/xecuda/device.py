@@ -1,194 +1,228 @@
 """
-XeCUDA Real Hardware Layer - Python binding to Intel Level Zero (ze_loader.dll)
-=================================================================================
-100% real hardware calls. No simulation. No sleep(). No fake responses.
-All operations go through the real Intel GPU driver.
-
-Tested and verified on:
-  - Intel Arc 130V GPU (8GB) - Device ID 0x64A0 - 1850 MHz
-  - Intel Core Ultra 5 226V (Lunar Lake, Xe2-LPG)
-  - ze_loader.dll (Intel Level Zero Driver for Windows)
+XeCUDA Device Layer — Real Intel Arc GPU via OpenCL 3.0
+======================================================
+ALL memory operations go through OpenCL buffers on the actual Intel Arc 130V GPU.
+ALL device queries come from the real hardware via clGetDeviceInfo.
+Zero simulation. Zero fake values. Real GPU.
 """
 
 import ctypes
-import struct
-import time
 import os
-from ctypes import (
-    c_int, c_uint32, c_uint64, c_float, c_size_t,
-    byref, c_void_p, c_char, POINTER, Structure, cast
-)
 
-# ───────────────────────────────────────────────────────────
-# Level Zero Structures
-# ───────────────────────────────────────────────────────────
+CL_DEVICE_TYPE_ALL = ctypes.c_ulonglong(0xFFFFFFFF)
+CL_MEM_READ_WRITE = 0x0001
+CL_SUCCESS = 0
 
-class ze_context_desc_t(Structure):
-    _fields_ = [('stype', c_uint32), ('pNext', c_void_p), ('flags', c_uint32)]
 
-class ze_device_properties_t(Structure):
-    _fields_ = [
-        ('stype', c_uint32), ('pNext', c_void_p),
-        ('type', c_uint32), ('vendorId', c_uint32), ('deviceId', c_uint32),
-        ('flags', c_uint32), ('subdeviceId', c_uint32),
-        ('coreClockRate', c_uint32), ('maxMemAllocSize', c_uint64),
-        ('maxHardwareContexts', c_uint32), ('maxCommandQueuePriority', c_uint32),
-        ('numThreadsPerEU', c_uint32), ('physicalEUSimdWidth', c_uint32),
-        ('numEUsPerSubslice', c_uint32), ('numSubslicesPerSlice', c_uint32),
-        ('numSlices', c_uint32), ('timerResolution', c_uint64),
-        ('timestampValidBits', c_uint32), ('kernelTimestampValidBits', c_uint32),
-        ('uuid', c_char * 16), ('name', c_char * 256),
-    ]
+def _P(v):
+    return ctypes.c_void_p(v)
 
-class ze_device_mem_alloc_desc_t(Structure):
-    _fields_ = [('stype', c_uint32), ('pNext', c_void_p), ('flags', c_uint32), ('ordinal', c_uint32)]
-
-class ze_host_mem_alloc_desc_t(Structure):
-    _fields_ = [('stype', c_uint32), ('pNext', c_void_p), ('flags', c_uint32)]
-
-# ───────────────────────────────────────────────────────────
-# XeCUDA Real Hardware Context
-# ───────────────────────────────────────────────────────────
 
 class XeCudaDevice:
     """
-    Real Intel Arc GPU context using Intel Level Zero driver.
-    All memory allocations and device queries go through ze_loader.dll.
+    Real Intel Arc GPU context via OpenCL 3.0 (Intel NEO driver).
+    All memory is allocated as cl_mem GPU buffers.
     """
 
     def __init__(self):
-        self._dll = None
-        self._driver = None
-        self._device = None
-        self._context = None
-        self.properties = None
+        self._ocl = ctypes.WinDLL("OpenCL.dll")
+        self._ocl.clCreateContext.restype = ctypes.c_void_p
+        self._ocl.clCreateBuffer.restype = ctypes.c_void_p
+        self._ocl.clCreateProgramWithSource.restype = ctypes.c_void_p
+        self._ocl.clCreateKernel.restype = ctypes.c_void_p
+        self._ocl.clCreateCommandQueueWithProperties.restype = ctypes.c_void_p
+
+        self._programs = {}
+        self._buffers = []
         self.initialized = False
-        self._allocations = []
         self._init()
 
     def _init(self):
-        try:
-            self._dll = ctypes.windll.LoadLibrary('ze_loader.dll')
-        except OSError as e:
-            raise RuntimeError(f"[XeCUDA] Cannot load ze_loader.dll: {e}")
+        n_plat = ctypes.c_uint32(0)
+        self._ocl.clGetPlatformIDs(0, None, ctypes.byref(n_plat))
+        platforms = (ctypes.c_void_p * n_plat.value)()
+        self._ocl.clGetPlatformIDs(n_plat, platforms, None)
+        self._plat = _P(platforms[0])
 
-        # zeInit
-        self._dll.zeInit.restype = c_int
-        r = self._dll.zeInit(0)
-        if r != 0:
-            raise RuntimeError(f"[XeCUDA] zeInit failed: 0x{r:X}")
+        dc = ctypes.c_uint32(0)
+        self._ocl.clGetDeviceIDs(self._plat, CL_DEVICE_TYPE_ALL, 0, None, ctypes.byref(dc))
+        devs = (ctypes.c_void_p * dc.value)()
+        self._ocl.clGetDeviceIDs(self._plat, CL_DEVICE_TYPE_ALL, dc, devs, None)
+        self._dev = _P(devs[0])
+        self._devs_arr = devs
 
-        # zeDriverGet
-        self._dll.zeDriverGet.restype = c_int
-        count = c_uint32(0)
-        self._dll.zeDriverGet(byref(count), None)
-        if count.value == 0:
-            raise RuntimeError("[XeCUDA] No Level Zero drivers found.")
-        drivers = (c_void_p * count.value)()
-        self._dll.zeDriverGet(byref(count), drivers)
-        self._driver = c_void_p(drivers[0])
+        name_buf = ctypes.create_string_buffer(256)
+        self._ocl.clGetDeviceInfo(self._dev, 0x102F, 256, name_buf, None)
+        self.gpu_name = name_buf.value.decode()
 
-        # zeDeviceGet
-        self._dll.zeDeviceGet.restype = c_int
-        dev_count = c_uint32(0)
-        self._dll.zeDeviceGet(self._driver, byref(dev_count), None)
-        if dev_count.value == 0:
-            raise RuntimeError("[XeCUDA] No GPU devices found.")
-        devices = (c_void_p * dev_count.value)()
-        self._dll.zeDeviceGet(self._driver, byref(dev_count), devices)
-        self._device = c_void_p(devices[0])
+        cu = ctypes.c_uint32(0)
+        self._ocl.clGetDeviceInfo(self._dev, 0x1002, 4, ctypes.byref(cu), None)
+        self.num_compute_units = cu.value
 
-        # zeContextCreate
-        self._dll.zeContextCreate.restype = c_int
-        ctx_desc = ze_context_desc_t()
-        ctx_desc.stype = 0x00010004
-        self._context = c_void_p(0)
-        r = self._dll.zeContextCreate(self._driver, byref(ctx_desc), byref(self._context))
-        if r != 0:
-            raise RuntimeError(f"[XeCUDA] zeContextCreate failed: 0x{r:X}")
+        vendor_buf = ctypes.create_string_buffer(256)
+        self._ocl.clGetDeviceInfo(self._dev, 0x102C, 256, vendor_buf, None)
+        self.vendor = vendor_buf.value.decode()
 
-        # Get device properties from hardware
-        self._dll.zeDeviceGetProperties.restype = c_int
-        props = ze_device_properties_t()
-        props.stype = 0x00010001
-        self._dll.zeDeviceGetProperties(self._device, byref(props))
-        self.properties = props
+        self._ocl.clGetDeviceInfo(self._dev, 0x1097, 256, name_buf, None)
+        self.driver_version = name_buf.value.decode()
 
-        total_eus = props.numEUsPerSubslice * props.numSubslicesPerSlice * props.numSlices
-        self.gpu_name = props.name.decode('utf-8', errors='replace')
-        self.vendor_id = props.vendorId
-        self.device_id = props.deviceId
-        self.clock_mhz = props.coreClockRate
-        self.max_mem_gb = props.maxMemAllocSize // (1024**3)
-        self.total_eus = total_eus
+        global_mem = ctypes.c_ulonglong(0)
+        self._ocl.clGetDeviceInfo(self._dev, 0x101F, 8, ctypes.byref(global_mem), None)
+        self.total_memory_bytes = global_mem.value
+
+        max_alloc = ctypes.c_ulonglong(0)
+        self._ocl.clGetDeviceInfo(self._dev, 0x1010, 8, ctypes.byref(max_alloc), None)
+        self.max_alloc_bytes = max_alloc.value
+
+        err = ctypes.c_int32(0)
+        self._ctx = _P(self._ocl.clCreateContext(None, 1, devs, None, None, ctypes.byref(err)))
+        if err.value != 0:
+            raise RuntimeError(f"[XeCUDA] clCreateContext failed: {err.value}")
+
+        err3 = ctypes.c_int32(0)
+        self._queue = _P(self._ocl.clCreateCommandQueueWithProperties(self._ctx, self._dev, None, ctypes.byref(err3)))
+        if err3.value != 0:
+            raise RuntimeError(f"[XeCUDA] clCreateCommandQueueWithProperties failed: {err3.value}")
+
         self.initialized = True
 
     def malloc(self, size_bytes: int) -> int:
-        """
-        Real GPU memory allocation via zeMemAllocShared (Unified Shared Memory).
-        Returns a real hardware memory pointer.
-        """
-        self._dll.zeMemAllocShared.restype = c_int
-        dev_desc = ze_device_mem_alloc_desc_t()
-        dev_desc.stype = 0x00010019
-        host_desc = ze_host_mem_alloc_desc_t()
-        host_desc.stype = 0x0001001A
-        ptr = c_void_p(0)
-        r = self._dll.zeMemAllocShared(
-            self._context, byref(dev_desc), byref(host_desc),
-            c_size_t(size_bytes), c_size_t(64), self._device, byref(ptr)
+        """Allocate GPU buffer via OpenCL. Returns cl_mem handle as int."""
+        err = ctypes.c_int32(0)
+        buf = self._ocl.clCreateBuffer(self._ctx, CL_MEM_READ_WRITE, size_bytes, None, ctypes.byref(err))
+        if err.value != 0 or buf is None:
+            raise MemoryError(f"[XeCUDA] clCreateBuffer({size_bytes} bytes) failed: err={err.value}")
+        handle = buf if isinstance(buf, int) else ctypes.cast(buf, ctypes.c_void_p).value
+        self._buffers.append(handle)
+        return handle
+
+    def free(self, buf_handle: int):
+        """Release GPU buffer."""
+        if buf_handle in self._buffers:
+            self._buffers.remove(buf_handle)
+        self._ocl.clReleaseMemObject(_P(buf_handle))
+
+    def write_buffer(self, buf_handle: int, host_ptr, size_bytes: int):
+        """Copy host data to GPU buffer via clEnqueueWriteBuffer."""
+        self._ocl.clEnqueueWriteBuffer(
+            self._queue, _P(buf_handle), 1, 0, size_bytes,
+            host_ptr, 0, None, None
         )
-        if r != 0 or ptr.value is None:
-            raise MemoryError(f"[XeCUDA] zeMemAllocShared({size_bytes} bytes) failed: 0x{r:X}")
-        self._allocations.append(ptr.value)
-        return ptr.value
 
-    def free(self, ptr: int):
-        """Real GPU memory deallocation via zeMemFree."""
-        self._dll.zeMemFree.restype = c_int
-        self._dll.zeMemFree(self._context, c_void_p(ptr))
-        if ptr in self._allocations:
-            self._allocations.remove(ptr)
+    def read_buffer(self, buf_handle: int, host_ptr, size_bytes: int):
+        """Copy GPU buffer to host data via clEnqueueReadBuffer."""
+        self._ocl.clEnqueueReadBuffer(
+            self._queue, _P(buf_handle), 1, 0, size_bytes,
+            host_ptr, 0, None, None
+        )
 
-    def memset(self, ptr: int, value: int, size_bytes: int):
-        """Write value into real GPU USM memory."""
-        ctypes.memset(ptr, value, size_bytes)
-
-    def memcpy_h2d(self, dst_ptr: int, src_list: list, dtype='f'):
-        """Copy Python list into real GPU USM memory as C floats."""
+    def memcpy_h2d(self, dst_handle: int, src_list: list, dtype="f"):
+        """Copy Python list into GPU buffer."""
         n = len(src_list)
-        arr = (c_float * n)(*src_list)
-        ctypes.memmove(dst_ptr, arr, n * 4)
+        arr = (ctypes.c_float * n)(*src_list)
+        self.write_buffer(dst_handle, ctypes.byref(arr), n * 4)
 
-    def memcpy_d2h(self, src_ptr: int, n: int) -> list:
-        """Copy real GPU USM memory back to Python list."""
-        arr = (c_float * n).from_address(src_ptr)
+    def memcpy_d2h(self, src_handle: int, n: int) -> list:
+        """Copy GPU buffer to Python list."""
+        arr = (ctypes.c_float * n)()
+        self.read_buffer(src_handle, ctypes.byref(arr), n * 4)
         return list(arr)
 
+    def memset(self, buf_handle: int, value: int, size_bytes: int):
+        """Fill GPU buffer with value using a simple kernel."""
+        k = self.build_kernel("memset_fill", b"""
+__kernel void memset_fill(__global uint* buf, const uint val, const int N) {
+    int i = get_global_id(0);
+    if (i < N) buf[i] = val;
+}
+""", b"memset_fill")
+        fill_u32 = (value & 0xFF) * 0x01010101
+        n_words = size_bytes // 4
+        self.enqueue_kernel(k, (n_words + 255) // 256 * 256, 256, [
+            ctypes.c_void_p(buf_handle),
+            ctypes.c_int32(fill_u32),
+            ctypes.c_int32(n_words),
+        ])
+        self.finish()
+
+    def _get_program(self, name: str, source: bytes) -> ctypes.c_void_p:
+        """Get or compile an OpenCL program (cached)."""
+        if name in self._programs:
+            return self._programs[name]
+        sa = (ctypes.c_char_p * 1)(source)
+        la = (ctypes.c_size_t * 1)(len(source))
+        err = ctypes.c_int32(0)
+        prog = _P(self._ocl.clCreateProgramWithSource(self._ctx, 1, sa, la, ctypes.byref(err)))
+        if err.value != 0:
+            raise RuntimeError(f"[XeCUDA] clCreateProgramWithSource failed: {err.value}")
+        build_r = self._ocl.clBuildProgram(prog, 1, self._devs_arr, None, None, None)
+        if build_r != 0:
+            log = ctypes.create_string_buffer(4096)
+            self._ocl.clGetProgramBuildInfo(prog, self._dev, 0x1084, 4096, log, None)
+            raise RuntimeError(f"[XeCUDA] Kernel build failed: {log.value.decode()}")
+        self._programs[name] = prog
+        return prog
+
+    def build_kernel(self, kernel_name: str, source: bytes, func_name: bytes) -> ctypes.c_void_p:
+        """Compile and return an OpenCL kernel."""
+        prog = self._get_program(kernel_name, source)
+        err = ctypes.c_int32(0)
+        k = _P(self._ocl.clCreateKernel(prog, func_name, ctypes.byref(err)))
+        if err.value != 0:
+            raise RuntimeError(f"[XeCUDA] clCreateKernel('{func_name.decode()}') failed: {err.value}")
+        return k
+
+    def enqueue_kernel(self, kernel, global_size, local_size, args):
+        """Launch an OpenCL kernel with the given arguments."""
+        for i, arg in enumerate(args):
+            if isinstance(arg, int):
+                val = ctypes.c_void_p(arg)
+                self._ocl.clSetKernelArg(kernel, i, ctypes.sizeof(val), ctypes.pointer(val))
+            elif isinstance(arg, ctypes.c_int32):
+                self._ocl.clSetKernelArg(kernel, i, 4, ctypes.pointer(arg))
+            elif isinstance(arg, ctypes.c_float):
+                self._ocl.clSetKernelArg(kernel, i, 4, ctypes.pointer(arg))
+            elif isinstance(arg, ctypes.c_void_p):
+                self._ocl.clSetKernelArg(kernel, i, ctypes.sizeof(arg), ctypes.pointer(arg))
+            else:
+                raise TypeError(f"Unsupported arg type: {type(arg)}")
+        gs = ctypes.c_size_t(global_size)
+        ls = ctypes.c_size_t(local_size)
+        self._ocl.clEnqueueNDRangeKernel(
+            self._queue, kernel, 1, None,
+            ctypes.pointer(gs), ctypes.pointer(ls), 0, None, None
+        )
+
+    def finish(self):
+        """Synchronize: wait for all GPU operations to complete."""
+        self._ocl.clFinish(self._queue)
+
     def info(self) -> dict:
-        """Returns verified real hardware properties."""
         return {
-            "gpu_name":    self.gpu_name,
-            "vendor_id":   f"0x{self.vendor_id:04X}",
-            "device_id":   f"0x{self.device_id:04X}",
-            "clock_mhz":   self.clock_mhz,
-            "max_mem_gb":  self.max_mem_gb,
-            "total_eus":   self.total_eus,
-            "driver":      "Intel Level Zero (ze_loader.dll)",
+            "gpu_name": self.gpu_name,
+            "vendor": self.vendor,
+            "driver": self.driver_version,
+            "compute_units": self.num_compute_units,
+            "total_memory_gb": round(self.total_memory_bytes / (1024**3), 2),
+            "max_alloc_gb": round(self.max_alloc_bytes / (1024**3), 2),
             "initialized": self.initialized,
+            "backend": "OpenCL 3.0 Intel NEO (Real GPU)",
         }
 
     def shutdown(self):
-        """Cleanup all allocations and destroy context."""
-        for ptr in list(self._allocations):
-            self.free(ptr)
-        if self._context and self._context.value:
-            self._dll.zeContextDestroy.restype = c_int
-            self._dll.zeContextDestroy(self._context)
+        for h in list(self._buffers):
+            try:
+                self.free(h)
+            except Exception:
+                pass
+        if hasattr(self, "_queue") and self._queue:
+            self._ocl.clReleaseCommandQueue(self._queue)
+        if hasattr(self, "_ctx") and self._ctx:
+            self._ocl.clReleaseContext(self._ctx)
         self.initialized = False
 
     def __repr__(self):
-        return f"XeCudaDevice({self.gpu_name}, {self.clock_mhz} MHz, driver=ze_loader.dll)"
+        return f"XeCudaDevice({self.gpu_name}, {self.num_compute_units} CU, OpenCL 3.0)"
 
     def __del__(self):
         try:

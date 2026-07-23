@@ -1,17 +1,93 @@
 /**
  * @file xecuda_blas.cpp
- * @brief BLAS & Native Q4_K_M Matrix-Vector Execution Engine for Intel Arc
+ * @brief BLAS & Q4_K_M Matrix-Vector — Real GPU Dispatch via OpenCL
  */
 
 #include "../include/xecuda_blas.h"
+#include "../include/xecuda_ocl.h"
 #include <iostream>
-#include <vector>
-#include <cmath>
-#include <algorithm>
+#include <cstring>
 
 struct xeCublasContext {
     int activeDevice;
 };
+
+// ============================================================================
+// SGEMM kernel source (compiled on GPU at first call)
+// ============================================================================
+
+static const char* SGEMM_SRC =
+    "__kernel void sgemm_cl(\n"
+    "    const int M, const int N, const int K,\n"
+    "    __global const float* A, __global const float* B,\n"
+    "    __global float* C,\n"
+    "    const float alpha, const float beta)\n"
+    "{\n"
+    "    int row = get_global_id(0);\n"
+    "    int col = get_global_id(1);\n"
+    "    if (row < M && col < N) {\n"
+    "        float sum = 0.0f;\n"
+    "        for (int k = 0; k < K; k++)\n"
+    "            sum += A[row * K + k] * B[k * N + col];\n"
+    "        C[row * N + col] = alpha * sum + beta * C[row * N + col];\n"
+    "    }\n"
+    "}\n";
+
+static const char* VEC_ADD_SRC =
+    "__kernel void vec_add_cl(\n"
+    "    __global const float* A, __global const float* B,\n"
+    "    __global float* C, const int N)\n"
+    "{\n"
+    "    int i = get_global_id(0);\n"
+    "    if (i < N) C[i] = A[i] + B[i];\n"
+    "}\n";
+
+static const char* MATVEC_SRC =
+    "__kernel void matvec_cl(\n"
+    "    __global const uchar* q4, __global const float* x,\n"
+    "    __global float* y, const int rows, const int cols)\n"
+    "{\n"
+    "    int r = get_global_id(0);\n"
+    "    if (r >= rows) return;\n"
+    "    int hc = cols / 2;\n"
+    "    float sum = 0.0f;\n"
+    "    for (int c = 0; c < hc; c++) {\n"
+    "        uchar b = q4[r * hc + c];\n"
+    "        float w0 = (float)((b & 0x0F) - 8) * 0.0625f;\n"
+    "        float w1 = (float)(((b >> 4) & 0x0F) - 8) * 0.0625f;\n"
+    "        int col = c * 2;\n"
+    "        if (col < cols)     sum += w0 * x[col];\n"
+    "        if (col + 1 < cols) sum += w1 * x[col + 1];\n"
+    "    }\n"
+    "    y[r] = sum;\n"
+    "}\n";
+
+static cl_program  g_sgemmProg  = nullptr;
+static cl_kernel   g_sgemmKernel = nullptr;
+static cl_program  g_matvecProg = nullptr;
+static cl_kernel   g_matvecKernel = nullptr;
+
+static bool ensureSgemmKernel() {
+    if (g_sgemmKernel) return true;
+    if (!xoc::isInitialized()) return false;
+    g_sgemmProg = xoc::gpuCompileProgram(SGEMM_SRC, std::strlen(SGEMM_SRC));
+    if (!g_sgemmProg) return false;
+    g_sgemmKernel = xoc::gpuCreateKernel(g_sgemmProg, "sgemm_cl");
+    return g_sgemmKernel != nullptr;
+}
+
+static bool ensureMatvecKernel() {
+    if (g_matvecKernel) return true;
+    if (!xoc::isInitialized()) return false;
+    g_matvecProg = xoc::gpuCompileProgram(MATVEC_SRC, std::strlen(MATVEC_SRC));
+    if (!g_matvecProg) return false;
+    g_matvecKernel = xoc::gpuCreateKernel(g_matvecProg, "matvec_cl");
+    return g_matvecKernel != nullptr;
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 xeCudaError_t xeCublasCreate(xeCublasHandle_t* handle) {
     if (!handle) return xeCudaErrorInvalidValue;
@@ -37,44 +113,36 @@ xeCudaError_t xeCublasSgemm(
     float* C, int ldc
 ) {
     if (!handle || !A || !B || !C || !alpha || !beta) return xeCudaErrorInvalidValue;
+    if (transa != XE_CUBLAS_OP_N || transb != XE_CUBLAS_OP_N) return xeCudaErrorNotYetImplemented;
+    if (!xoc::isInitialized()) return xeCudaErrorInitializationError;
+    if (!ensureSgemmKernel()) return xeCudaErrorInitializationError;
 
-    float aVal = *alpha;
-    float bVal = *beta;
+    // A, B, C are device pointers (cl_mem handles) per CUDA convention
+    cl_mem dA = (cl_mem)A;
+    cl_mem dB = (cl_mem)B;
+    cl_mem dC = (cl_mem)C;
 
-    const int BLOCK_SIZE = 32;
+    cl_int mM = m, nN = n, kK = k;
+    xoc::gpuSetArg(g_sgemmKernel, 0, sizeof(cl_int), &mM);
+    xoc::gpuSetArg(g_sgemmKernel, 1, sizeof(cl_int), &nN);
+    xoc::gpuSetArg(g_sgemmKernel, 2, sizeof(cl_int), &kK);
+    xoc::gpuSetArg(g_sgemmKernel, 3, sizeof(cl_mem), &dA);
+    xoc::gpuSetArg(g_sgemmKernel, 4, sizeof(cl_mem), &dB);
+    xoc::gpuSetArg(g_sgemmKernel, 5, sizeof(cl_mem), &dC);
+    xoc::gpuSetArg(g_sgemmKernel, 6, sizeof(float), alpha);
+    xoc::gpuSetArg(g_sgemmKernel, 7, sizeof(float), beta);
 
-#pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int i = 0; i < m; i += BLOCK_SIZE) {
-        for (int j = 0; j < n; j += BLOCK_SIZE) {
-            int i_end = std::min(i + BLOCK_SIZE, m);
-            int j_end = std::min(j + BLOCK_SIZE, n);
+    size_t gs[2] = { (size_t)((m + 15) / 16 * 16), (size_t)((n + 15) / 16 * 16) };
+    size_t ls[2] = { 16, 16 };
+    cl_int err = xoc::func().EnqueueNDRangeKernel(
+        xoc::state().queue, g_sgemmKernel, 2, nullptr, gs, ls, 0, nullptr, nullptr
+    );
+    xoc::gpuSync();
 
-            for (int ii = i; ii < i_end; ++ii) {
-                for (int jj = j; jj < j_end; ++jj) {
-                    float sum = 0.0f;
-                    for (int kk = 0; kk < k; ++kk) {
-                        float valA = (transa == XE_CUBLAS_OP_N) ? A[ii * lda + kk] : A[kk * lda + ii];
-                        float valB = (transb == XE_CUBLAS_OP_N) ? B[kk * ldb + jj] : B[jj * ldb + kk];
-                        sum += valA * valB;
-                    }
-
-                    if (bVal == 0.0f) {
-                        C[ii * ldc + jj] = aVal * sum;
-                    } else {
-                        C[ii * ldc + jj] = aVal * sum + bVal * C[ii * ldc + jj];
-                    }
-                }
-            }
-        }
-    }
-
+    if (err != CL_SUCCESS) return xeCudaErrorInitializationError;
     return xeCudaSuccess;
 }
 
-/**
- * Native Q4_K_M Dequantization & Vector Multiplication Engine for XeCUDA
- * Block size 256: 4-bit quantized weights packed in nibbles with FP16 scale/min.
- */
 xeCudaError_t xeCudaMatVecQ4KM(
     const uint8_t* q4_weights,
     const float* x_in,
@@ -83,28 +151,39 @@ xeCudaError_t xeCudaMatVecQ4KM(
     int cols
 ) {
     if (!q4_weights || !x_in || !y_out) return xeCudaErrorInvalidValue;
+    if (!xoc::isInitialized()) return xeCudaErrorInitializationError;
+    if (!ensureMatvecKernel()) return xeCudaErrorInitializationError;
 
-#pragma omp parallel for schedule(dynamic)
-    for (int r = 0; r < rows; ++r) {
-        float sum = 0.0f;
-        const uint8_t* row_bytes = q4_weights + r * (cols / 2);
+    int halfCols = cols / 2;
+    size_t sizeQ4 = (size_t)rows * halfCols;
+    size_t sizeX = (size_t)cols * sizeof(float);
+    size_t sizeY = (size_t)rows * sizeof(float);
 
-        for (int c = 0; c < cols; c += 2) {
-            uint8_t byte_val = row_bytes[c / 2];
-
-            // Extract 4-bit nibbles
-            int nibble_low = byte_val & 0x0F;
-            int nibble_high = (byte_val >> 4) & 0x0F;
-
-            // Dequantize centered at 0 with scale 0.1
-            float w0 = static_cast<float>(nibble_low - 8) * 0.1f;
-            float w1 = static_cast<float>(nibble_high - 8) * 0.1f;
-
-            sum += w0 * x_in[c] + w1 * x_in[c + 1];
-        }
-
-        y_out[r] = sum;
+    cl_mem dQ4 = xoc::gpuMalloc(sizeQ4);
+    cl_mem dX  = xoc::gpuMalloc(sizeX);
+    cl_mem dY  = xoc::gpuMalloc(sizeY);
+    if (!dQ4 || !dX || !dY) {
+        xoc::gpuFree(dQ4); xoc::gpuFree(dX); xoc::gpuFree(dY);
+        return xeCudaErrorMemoryAllocation;
     }
 
+    xoc::gpuWrite(dQ4, q4_weights, sizeQ4);
+    xoc::gpuWrite(dX, x_in, sizeX);
+
+    cl_int rRows = rows, rCols = cols;
+    xoc::gpuSetArg(g_matvecKernel, 0, sizeof(cl_mem), &dQ4);
+    xoc::gpuSetArg(g_matvecKernel, 1, sizeof(cl_mem), &dX);
+    xoc::gpuSetArg(g_matvecKernel, 2, sizeof(cl_mem), &dY);
+    xoc::gpuSetArg(g_matvecKernel, 3, sizeof(cl_int), &rRows);
+    xoc::gpuSetArg(g_matvecKernel, 4, sizeof(cl_int), &rCols);
+
+    size_t gs = ((size_t)rows + 255) / 256 * 256;
+    xoc::gpuLaunch(g_matvecKernel, gs, 256);
+    xoc::gpuSync();
+
+    xoc::gpuRead(dY, y_out, sizeY);
+    xoc::gpuFree(dQ4);
+    xoc::gpuFree(dX);
+    xoc::gpuFree(dY);
     return xeCudaSuccess;
 }

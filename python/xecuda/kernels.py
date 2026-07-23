@@ -1,107 +1,149 @@
 """
-XeCUDA Compute Kernels — NumPy-accelerated on USM memory
-=========================================================
-All kernels operate on real GPU Unified Shared Memory pointers (from zeMemAllocShared).
-NumPy provides BLAS-backed SIMD vectorization for maximum CPU throughput.
-
-Full GPU-side SPIR-V kernel dispatch requires Intel oneAPI DPC++ compiler.
-These kernels use the zero-copy shared memory architecture of Lunar Lake.
+XeCUDA GPU Kernels — Real OpenCL dispatch on Intel Arc 130V
+===========================================================
+ALL computation runs on the actual GPU via OpenCL kernel dispatch.
+No NumPy fallback. No CPU simulation. Real GPU compute.
 """
 
-import ctypes
 import time
-import numpy as np
-from ctypes import c_float
-from .device import XeCudaDevice
+import ctypes
+from .device import XeCudaDevice, _P
 
 
-def _usm_as_ndarray(ptr: int, n: int) -> np.ndarray:
-    """Create a NumPy view over a USM pointer (zero-copy, no allocation)."""
-    arr = (c_float * n).from_address(ptr)
-    return np.ctypeslib.as_array(arr)
+# ─── OpenCL kernel sources ───────────────────────────────────────────
+
+VEC_ADD_SRC = b"""
+__kernel void vector_add(
+    __global const float* A, __global const float* B,
+    __global float* C, const int N)
+{
+    int i = get_global_id(0);
+    if (i < N) C[i] = A[i] + B[i];
+}
+"""
+
+SGEMM_SRC = b"""
+__kernel void sgemm(
+    const int M, const int N, const int K,
+    __global const float* A, __global const float* B,
+    __global float* C,
+    const float alpha, const float beta)
+{
+    int row = get_global_id(0);
+    int col = get_global_id(1);
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = alpha * sum + beta * C[row * N + col];
+    }
+}
+"""
+
+MATVEC_Q4_SRC = b"""
+__kernel void matvec_q4km(
+    __global const uchar* q4_weights,
+    __global const float* x,
+    __global float* y,
+    const int rows, const int cols)
+{
+    int r = get_global_id(0);
+    if (r >= rows) return;
+    int half_cols = cols / 2;
+    float sum = 0.0f;
+    int row_offset = r * half_cols;
+    for (int c = 0; c < half_cols; c++) {
+        uchar byte_val = q4_weights[row_offset + c];
+        int nibble_low = (byte_val & 0x0F) - 8;
+        int nibble_high = ((byte_val >> 4) & 0x0F) - 8;
+        int col = c * 2;
+        if (col < cols)
+            sum += (float)nibble_low * 0.0625f * x[col];
+        if (col + 1 < cols)
+            sum += (float)nibble_high * 0.0625f * x[col + 1];
+    }
+    y[r] = sum;
+}
+"""
 
 
 def vector_add(device: XeCudaDevice, ptr_a: int, ptr_b: int, ptr_c: int, n: int):
-    """Vector addition C = A + B on USM memory (NumPy SIMD)."""
-    a = _usm_as_ndarray(ptr_a, n)
-    b = _usm_as_ndarray(ptr_b, n)
-    c = _usm_as_ndarray(ptr_c, n)
-    np.add(a, b, out=c)
+    """Vector addition C = A + B — dispatched to Intel Arc GPU via OpenCL."""
+    k = device.build_kernel("vec_add", VEC_ADD_SRC, b"vector_add")
+    bufA = ctypes.c_void_p(ptr_a)
+    bufB = ctypes.c_void_p(ptr_b)
+    bufC = ctypes.c_void_p(ptr_c)
+    n_val = ctypes.c_int32(n)
+    device.enqueue_kernel(k, (n + 255) // 256 * 256, 256, [bufA, bufB, bufC, n_val])
+    device.finish()
     return ptr_c
 
 
 def sgemm(device: XeCudaDevice, ptr_a: int, ptr_b: int, ptr_c: int,
           M: int, N: int, K: int, alpha: float = 1.0, beta: float = 0.0):
-    """SGEMM C = alpha * A*B + beta*C on USM memory (NumPy BLAS)."""
-    a = _usm_as_ndarray(ptr_a, M * K).reshape(M, K)
-    b = _usm_as_ndarray(ptr_b, K * N).reshape(K, N)
-    c = _usm_as_ndarray(ptr_c, M * N).reshape(M, N)
-
-    result = alpha * (a @ b)
-    if beta != 0.0:
-        result += beta * c
-    np.copyto(c, result)
+    """SGEMM C = alpha*A*B + beta*C — dispatched to Intel Arc GPU via OpenCL."""
+    k = device.build_kernel("sgemm", SGEMM_SRC, b"sgemm")
+    bufA = ctypes.c_void_p(ptr_a)
+    bufB = ctypes.c_void_p(ptr_b)
+    bufC = ctypes.c_void_p(ptr_c)
+    args = [
+        ctypes.c_int32(M), ctypes.c_int32(N), ctypes.c_int32(K),
+        bufA, bufB, bufC,
+        ctypes.c_float(alpha), ctypes.c_float(beta)
+    ]
+    device.enqueue_kernel(k, max(M, N), 16, args)
+    device.finish()
     return ptr_c
 
 
 def matvec_q4km(device: XeCudaDevice, q4_bytes: bytes, ptr_x: int, ptr_y: int,
                 rows: int, cols: int):
-    """Q4_K_M matrix-vector multiplication on USM memory.
-
-    Dequantizes 4-bit nibbles from GGUF tensor data, then computes y = W * x.
-    """
+    """Q4_K_M matrix-vector multiply — dispatched to Intel Arc GPU via OpenCL."""
     half_cols = cols // 2
     needed = rows * half_cols
     if len(q4_bytes) < needed:
-        raise ValueError(
-            f"matvec_q4km: need {needed} bytes for {rows}x{cols}, got {len(q4_bytes)}"
-        )
+        raise ValueError(f"matvec_q4km: need {needed} bytes, got {len(q4_bytes)}")
 
-    weights = np.frombuffer(q4_bytes[:needed], dtype=np.uint8).reshape(rows, half_cols)
+    ptr_q4 = device.malloc(needed)
+    device.write_buffer(ptr_q4, (ctypes.c_ubyte * needed)(*q4_bytes[:needed]), needed)
 
-    nibble_low = (weights & 0x0F).astype(np.float32) - 8.0
-    nibble_high = ((weights >> 4) & 0x0F).astype(np.float32) - 8.0
-
-    scale = 0.0625
-
-    x = _usm_as_ndarray(ptr_x, cols)
-
-    y = np.empty(rows, dtype=np.float32)
-    for r in range(rows):
-        y[r] = scale * (
-            np.dot(nibble_low[r], x[0::2]) + np.dot(nibble_high[r], x[1::2])
-        )
-
-    out = _usm_as_ndarray(ptr_y, rows)
-    np.copyto(out, y)
+    k = device.build_kernel("matvec_q4km", MATVEC_Q4_SRC, b"matvec_q4km")
+    buf_q4 = ctypes.c_void_p(ptr_q4)
+    buf_x = ctypes.c_void_p(ptr_x)
+    buf_y = ctypes.c_void_p(ptr_y)
+    device.enqueue_kernel(k, (rows + 255) // 256 * 256, 256,
+                          [buf_q4, buf_x, buf_y, ctypes.c_int32(rows), ctypes.c_int32(cols)])
+    device.finish()
+    device.free(ptr_q4)
     return ptr_y
 
 
 def benchmark_bandwidth(device: XeCudaDevice, size_mb: int = 64) -> dict:
-    """Measures real memory bandwidth of zeMemAllocShared on Intel Arc 130V."""
+    """Measures real GPU memory bandwidth via OpenCL read/write."""
     size_bytes = size_mb * 1024 * 1024
     n_floats = size_bytes // 4
 
-    ptr = device.malloc(size_bytes)
-    arr = _usm_as_ndarray(ptr, n_floats)
+    buf = device.malloc(size_bytes)
+    src = (ctypes.c_float * n_floats)(*[float(i % 65536) for i in range(n_floats)])
 
-    # Write benchmark (NumPy bulk fill)
     t0 = time.perf_counter()
-    arr[:] = np.arange(n_floats, dtype=np.float32) % 65536.0
+    device.write_buffer(buf, ctypes.byref(src), size_bytes)
+    device.finish()
     t1 = time.perf_counter()
     write_bw = (size_bytes / (1024**3)) / (t1 - t0)
 
-    # Read benchmark (NumPy sum)
+    out = (ctypes.c_float * n_floats)()
     t2 = time.perf_counter()
-    checksum = float(np.sum(arr))
+    device.read_buffer(buf, ctypes.byref(out), size_bytes)
+    device.finish()
     t3 = time.perf_counter()
     read_bw = (size_bytes / (1024**3)) / (t3 - t2)
 
-    device.free(ptr)
-
+    device.free(buf)
     return {
         "size_mb": size_mb,
         "write_bw_gbs": round(write_bw, 3),
         "read_bw_gbs": round(read_bw, 3),
-        "checksum": checksum,
+        "checksum": float(sum(out[i] for i in range(min(100, n_floats)))),
     }
