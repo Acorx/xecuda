@@ -1,25 +1,24 @@
 """
 XeCUDA Python Integration Engine
-Intel Arc GPU Compute & CUDA Migration Suite (Intel Arc 130V Lunar Lake Optimized)
+Intel Arc GPU Compute — Qwythos-9B GGUF Inference
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "XeCudaDevice",
-    "IntelArcInferenceEngine",
-    "init_torch_cuda_bridge",
-    "vector_add",
-    "sgemm",
-    "matvec_q4km",
+    "WeightLoader",
+    "Model",
     "benchmark_bandwidth",
-    "Tensor",
-    "Adam",
 ]
+
+from .device import XeCudaDevice
+from .weight_loader import WeightLoader
+from .model import Model
+from .kernels import benchmark_bandwidth
 
 
 def get_hardware_info():
-    """Return detected Intel GPU hardware specifications via OpenCL."""
     try:
         from .device import XeCudaDevice
         d = XeCudaDevice()
@@ -37,10 +36,3 @@ def get_hardware_info():
         }
     except Exception:
         return {"error": "GPU not detected"}
-
-
-from .torch_bridge import init_torch_cuda_bridge
-from .inference import IntelArcInferenceEngine
-from .device import XeCudaDevice
-from .kernels import vector_add, sgemm, matvec_q4km, benchmark_bandwidth
-from .autograd import Tensor, Adam
