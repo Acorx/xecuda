@@ -46,33 +46,44 @@ __kernel void rms_norm(
     __global const float* x,
     __global float* y,
     __global const float* w,
-    const int dim,
+    const int n,
     const float eps)
 {
-    int row = get_global_id(0);
+    int lid = get_local_id(0);
+    __local float lsum[256];
+
     float sum = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        float v = x[row * dim + i];
-        sum += v * v;
+    for (int i = lid; i < n; i += 256)
+        sum += x[i] * x[i];
+    lsum[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) lsum[lid] += lsum[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    float rms = 1.0f / sqrt(sum / dim + eps);
-    for (int i = 0; i < dim; i++) {
-        y[row * dim + i] = (x[row * dim + i] * rms) * w[i];
-    }
+
+    __local float inv_rms;
+    if (lid == 0) inv_rms = 1.0f / sqrt(lsum[0] / (float)n + eps);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int i = lid; i < n; i += 256)
+        y[i] = (x[i] * inv_rms) * w[i];
 }
 """
 
 
 def rms_norm(device, ptr_x, ptr_y, ptr_w, n_rows, dim, eps=1e-6):
     k = _get_kernel(device, "rms_norm", RMS_NORM_SRC, b"rms_norm")
+    n = n_rows * dim
     _set_args(device, k, [
         ctypes.c_void_p(ptr_x), ctypes.c_void_p(ptr_y), ctypes.c_void_p(ptr_w),
-        ctypes.c_int32(dim), ctypes.c_float(eps),
+        ctypes.c_int32(n), ctypes.c_float(eps),
     ])
     device._ocl.clEnqueueNDRangeKernel(
         device._queue, k, 1, None,
-        ctypes.pointer(ctypes.c_size_t(n_rows)),
-        ctypes.pointer(ctypes.c_size_t(1)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        ctypes.pointer(ctypes.c_size_t(256)),
         0, None, None,
     )
 
@@ -788,11 +799,102 @@ def add_rms_norm(device, ptr_dst, ptr_src, ptr_res, ptr_w, n, eps=1e-6):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Fused RMS norm + matvec: output = matvec(w, rms_norm(x, wt), n_rows, n_cols)
-# Eliminates norm output buffer round-trip
+# FUSED Norm+Matvec — Two-kernel approach:
+#   Kernel 1: rms_norm_reduce — single workgroup, computes inv_rms
+#   Kernel 2: norm_matvec — loads normalized x into local, matvec
+# Eliminates intermediate buffer write+read between norm and matvec.
 # ═══════════════════════════════════════════════════════════════════════
 
-RMS_NORM_MATVEC_Q4K_SRC = b"""
+RMS_NORM_REDUCE_SRC = b"""
+__kernel void rms_norm_reduce(
+    __global const float* x,
+    const int n,
+    __global float* out_inv_rms,
+    const float eps)
+{
+    int lid = get_local_id(0);
+    __local float lsum[256];
+
+    float sum = 0.0f;
+    for (int i = lid; i < n; i += 256)
+        sum += x[i] * x[i];
+    lsum[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) lsum[lid] += lsum[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0)
+        out_inv_rms[0] = 1.0f / sqrt(lsum[0] / (float)n + eps);
+}
+"""
+
+
+def rms_norm_reduce(device, ptr_x, ptr_out_rms, n, eps=1e-6):
+    k = _get_kernel(device, "rms_norm_reduce", RMS_NORM_REDUCE_SRC, b"rms_norm_reduce")
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_x), ctypes.c_int32(n),
+        ctypes.c_void_p(ptr_out_rms), ctypes.c_float(eps),
+    ])
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(256)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        0, None, None,
+    )
+
+
+ADD_RMS_NORM_REDUCE_SRC = b"""
+__kernel void add_rms_norm_reduce(
+    __global const float* x,
+    __global const float* residual,
+    const int n,
+    __global float* out_inv_rms,
+    const float eps)
+{
+    int lid = get_local_id(0);
+    __local float lsum[256];
+
+    float sum = 0.0f;
+    for (int i = lid; i < n; i += 256) {
+        float v = x[i] + residual[i];
+        sum += v * v;
+    }
+    lsum[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) lsum[lid] += lsum[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0)
+        out_inv_rms[0] = 1.0f / sqrt(lsum[0] / (float)n + eps);
+}
+"""
+
+
+def add_rms_norm_reduce(device, ptr_x, ptr_res, ptr_out_rms, n, eps=1e-6):
+    k = _get_kernel(device, "add_rms_norm_reduce", ADD_RMS_NORM_REDUCE_SRC, b"add_rms_norm_reduce")
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_x), ctypes.c_void_p(ptr_res),
+        ctypes.c_int32(n), ctypes.c_void_p(ptr_out_rms), ctypes.c_float(eps),
+    ])
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(256)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        0, None, None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# norm_matvec_q4k: reads inv_rms, loads normalized x into local, matvec
+# ═══════════════════════════════════════════════════════════════════════
+
+NORM_MATVEC_Q4K_SRC = b"""
 static inline float fp16_to_float_nm(ushort h) {
     uint f = ((h & 0x8000) << 16) | (((h & 0x7c00) + 0x1C000) << 13) | ((h & 0x03FF) << 13);
     return as_float(f);
@@ -813,38 +915,24 @@ static inline void get_scale_min_k4_nm(int j, __global const uchar* q,
     }
 }
 
-__kernel void rms_norm_matvec_q4k(
+__kernel void norm_matvec_q4k(
     __global const uchar* weights,
     __global const float* x,
     __global const float* norm_w,
+    const float inv_rms,
     __global float* y,
     const int n_cols,
     const int n_rows,
-    const float eps,
     __local float* x_local)
 {
     int lid = get_local_id(0);
     int wg_size = get_local_size(0);
+    int row = get_group_id(0) * wg_size + lid;
 
-    // Step 1: compute RMS of x (all threads participate in reduction)
-    __local float lsum[256];
-    float v = (lid < n_cols) ? x[lid] * x[lid] : 0.0f;
-    lsum[lid] = v;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) lsum[lid] += lsum[lid + s];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    float rms = sqrt(lsum[0] / (float)n_cols + eps);
-    float inv_rms = 1.0f / rms;
-
-    // Step 2: load normalized x into local memory
     for (int i = lid; i < n_cols; i += wg_size)
         x_local[i] = x[i] * inv_rms * norm_w[i];
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Step 3: matvec from local memory
-    int row = get_group_id(0) * wg_size + lid;
     if (row >= n_rows) return;
 
     int n_blocks = n_cols / 256;
@@ -888,16 +976,159 @@ __kernel void rms_norm_matvec_q4k(
 """
 
 
-def rms_norm_matvec_q4k(device, ptr_w, ptr_x, ptr_norm_w, ptr_y, n_rows, n_cols, eps=1e-6):
-    k = _get_kernel(device, "rms_norm_matvec_q4k", RMS_NORM_MATVEC_Q4K_SRC, b"rms_norm_matvec_q4k")
+def norm_matvec_q4k(device, ptr_w, ptr_x, ptr_norm_w, ptr_inv_rms, ptr_y, n_rows, n_cols):
+    k = _get_kernel(device, "norm_matvec_q4k", NORM_MATVEC_Q4K_SRC, b"norm_matvec_q4k")
     local_bytes = n_cols * 4
     _set_args(device, k, [
         ctypes.c_void_p(ptr_w), ctypes.c_void_p(ptr_x), ctypes.c_void_p(ptr_norm_w),
-        ctypes.c_void_p(ptr_y),
-        ctypes.c_int32(n_cols), ctypes.c_int32(n_rows), ctypes.c_float(eps),
+        ctypes.c_void_p(ptr_inv_rms), ctypes.c_void_p(ptr_y),
+        ctypes.c_int32(n_cols), ctypes.c_int32(n_rows),
     ])
     device._ocl.clSetKernelArg(k, 7, local_bytes, None)
     gs = ((n_rows + 255) // 256) * 256
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(gs)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        0, None, None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# add_norm_matvec_q4k: fused residual add + norm + matvec
+# ═══════════════════════════════════════════════════════════════════════
+
+ADD_NORM_MATVEC_Q4K_SRC = b"""
+static inline float fp16_to_float_anm(ushort h) {
+    uint f = ((h & 0x8000) << 16) | (((h & 0x7c00) + 0x1C000) << 13) | ((h & 0x03FF) << 13);
+    return as_float(f);
+}
+
+static inline ushort read_ushort_le_anm(__global const uchar* p) {
+    return (ushort)p[0] | ((ushort)p[1] << 8);
+}
+
+static inline void get_scale_min_k4_anm(int j, __global const uchar* q,
+                                         uchar* d, uchar* m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+__kernel void add_norm_matvec_q4k(
+    __global const uchar* weights,
+    __global const float* x,
+    __global const float* residual,
+    __global const float* norm_w,
+    const float inv_rms,
+    __global float* y,
+    const int n_cols,
+    const int n_rows,
+    __local float* x_local)
+{
+    int lid = get_local_id(0);
+    int wg_size = get_local_size(0);
+    int row = get_group_id(0) * wg_size + lid;
+
+    for (int i = lid; i < n_cols; i += wg_size)
+        x_local[i] = (x[i] + residual[i]) * inv_rms * norm_w[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (row >= n_rows) return;
+
+    int n_blocks = n_cols / 256;
+    long row_bytes = (long)n_blocks * 144;
+    __global const uchar* row_w = weights + (long)row * row_bytes;
+
+    float sum = 0.0f;
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        __global const uchar* w = row_w + (long)blk * 144;
+        float d = fp16_to_float_anm(read_ushort_le_anm(w + 0));
+        float dmin = fp16_to_float_anm(read_ushort_le_anm(w + 2));
+        __global const uchar* scales = w + 4;
+        __global const uchar* qs = w + 16;
+        int x_off = blk * 256;
+
+        int is = 0;
+        int q_off = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            uchar sc0, m0, sc1, m1;
+            get_scale_min_k4_anm(is, scales, &sc0, &m0);
+            get_scale_min_k4_anm(is + 1, scales, &sc1, &m1);
+            float d1 = d * (float)sc0;
+            float m1v = dmin * (float)m0;
+            float d2 = d * (float)sc1;
+            float m2v = dmin * (float)m1;
+
+            for (int l = 0; l < 32; l++) {
+                uchar qv = qs[q_off + l];
+                sum += (d1 * (float)(qv & 0x0F) - m1v) * x_local[x_off + j + l];
+                sum += (d2 * (float)(qv >> 4) - m2v) * x_local[x_off + j + l + 32];
+            }
+            q_off += 32;
+            is += 2;
+        }
+    }
+
+    y[row] = sum;
+}
+"""
+
+
+def add_norm_matvec_q4k(device, ptr_w, ptr_x, ptr_res, ptr_norm_w, ptr_inv_rms, ptr_y, n_rows, n_cols):
+    k = _get_kernel(device, "add_norm_matvec_q4k", ADD_NORM_MATVEC_Q4K_SRC, b"add_norm_matvec_q4k")
+    local_bytes = n_cols * 4
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_w), ctypes.c_void_p(ptr_x), ctypes.c_void_p(ptr_res),
+        ctypes.c_void_p(ptr_norm_w), ctypes.c_void_p(ptr_inv_rms),
+        ctypes.c_void_p(ptr_y),
+        ctypes.c_int32(n_cols), ctypes.c_int32(n_rows),
+    ])
+    device._ocl.clSetKernelArg(k, 8, local_bytes, None)
+    gs = ((n_rows + 255) // 256) * 256
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(gs)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        0, None, None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# add_norm: fused residual add + norm (writes to global buffer)
+# For shared-norm cases where multiple matvecs follow the norm.
+# ═══════════════════════════════════════════════════════════════════════
+
+ADD_NORM_SRC = b"""
+__kernel void add_norm(
+    __global const float* x,
+    __global const float* residual,
+    __global const float* norm_w,
+    const float inv_rms,
+    __global float* y,
+    const int n)
+{
+    int i = get_global_id(0);
+    if (i < n)
+        y[i] = (x[i] + residual[i]) * inv_rms * norm_w[i];
+}
+"""
+
+
+def add_norm(device, ptr_x, ptr_res, ptr_norm_w, ptr_inv_rms, ptr_y, n):
+    k = _get_kernel(device, "add_norm", ADD_NORM_SRC, b"add_norm")
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_x), ctypes.c_void_p(ptr_res),
+        ctypes.c_void_p(ptr_norm_w), ctypes.c_void_p(ptr_inv_rms),
+        ctypes.c_void_p(ptr_y), ctypes.c_int32(n),
+    ])
+    gs = ((n + 255) // 256) * 256
     device._ocl.clEnqueueNDRangeKernel(
         device._queue, k, 1, None,
         ctypes.pointer(ctypes.c_size_t(gs)),

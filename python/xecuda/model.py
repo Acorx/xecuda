@@ -47,6 +47,8 @@ class Model:
         self.buf_ssm_x = f32_1(D_MODEL)
         self.buf_ssm_out = f32_1(D_MODEL)
         self.buf_emb_row = f32_1(D_MODEL)
+        self.buf_inv_rms = f32_1(1)
+        self.buf_logits = None
 
     def _w(self, name):
         return self.wl.get(name)
@@ -63,6 +65,30 @@ class Model:
         else:
             K.matvec_f32(self.device, self._w(name), ptr_x, ptr_y, n_rows, n_cols)
 
+    def _norm_matvec(self, norm_name, matvec_name, ptr_x, ptr_y, n_rows, n_cols):
+        K.rms_norm_reduce(self.device, ptr_x, self.buf_inv_rms, n_cols)
+        qt = self.wl.qtype(matvec_name)
+        if qt == 12:
+            K.norm_matvec_q4k(self.device, self._w(matvec_name), ptr_x,
+                              self._w(norm_name), self.buf_inv_rms, ptr_y, n_rows, n_cols)
+        else:
+            K.rms_norm(self.device, ptr_x, self.buf_b, self._w(norm_name), 1, n_cols)
+            self._matvec(matvec_name, self.buf_b, ptr_y, n_rows, n_cols)
+
+    def _add_norm_matvec(self, norm_name, matvec_name, ptr_x, ptr_res, ptr_y, n_rows, n_cols):
+        K.add_rms_norm_reduce(self.device, ptr_x, ptr_res, self.buf_inv_rms, n_cols)
+        qt = self.wl.qtype(matvec_name)
+        if qt == 12:
+            K.add_norm_matvec_q4k(self.device, self._w(matvec_name), ptr_x, ptr_res,
+                                  self._w(norm_name), self.buf_inv_rms, ptr_y, n_rows, n_cols)
+        else:
+            K.add_rms_norm(self.device, ptr_x, ptr_x, ptr_res, self._w(norm_name), n_cols)
+            self._matvec(matvec_name, ptr_x, ptr_y, n_rows, n_cols)
+
+    def _add_norm(self, norm_name, ptr_x, ptr_res, ptr_y, n):
+        K.add_rms_norm_reduce(self.device, ptr_x, ptr_res, self.buf_inv_rms, n)
+        K.add_norm(self.device, ptr_x, ptr_res, self._w(norm_name), self.buf_inv_rms, ptr_y, n)
+
     def forward(self, token_id, seq_pos=0):
         self._lookup_embedding(token_id, self.buf_emb_row)
         K.copy_f32(self.device, self.buf_emb_row, self.buf_a, D_MODEL)
@@ -74,39 +100,39 @@ class Model:
             else:
                 self._forward_attn_only(layer_idx, seq_pos)
 
-        K.rms_norm(self.device, self.buf_a, self.buf_b,
-                   self._w("output_norm.weight"), 1, D_MODEL)
+        self._norm_matvec("output_norm.weight", "output.weight",
+                          self.buf_a, self.buf_b,
+                          self._shape("output.weight")[1], D_MODEL)
 
         out_shape = self._shape("output.weight")
         vocab_size = out_shape[1]
-        logits_buf = self.device.malloc(vocab_size * 4)
-        self._matvec("output.weight",
-                     self.buf_b, logits_buf, vocab_size, out_shape[0])
+
+        if self.buf_logits is None or self._logits_size != vocab_size:
+            if self.buf_logits is not None:
+                self.device.free(self.buf_logits)
+            self.buf_logits = self.device.malloc(vocab_size * 4)
+            self._logits_size = vocab_size
+        self._matvec("output.weight", self.buf_b, self.buf_logits, vocab_size, out_shape[0])
 
         logits = np.empty(vocab_size, dtype=np.float32)
-        self.device.read_buffer(logits_buf, logits.ctypes, vocab_size * 4)
-        self.device.free(logits_buf)
+        self.device.read_buffer(self.buf_logits, logits.ctypes, vocab_size * 4)
         return logits
 
     def _forward_hybrid(self, li, seq_pos):
         s = self._shape
 
-        # SSM block (simplified Mamba: norm → ssm_out projection → add)
-        # Full Mamba SSM requires selective scan; simplified version uses
-        # the output projection as a learned linear transformation.
-        K.rms_norm(self.device, self.buf_a, self.buf_b,
-                   self._w(f"blk.{li}.post_attention_norm.weight"), 1, D_MODEL)
+        # SSM: fused norm + ssm_out projection
         sh = s(f"blk.{li}.ssm_out.weight")
-        self._matvec(f"blk.{li}.ssm_out.weight",
-                     self.buf_b, self.buf_ssm_out, sh[1], sh[0])
+        self._norm_matvec(f"blk.{li}.post_attention_norm.weight",
+                          f"blk.{li}.ssm_out.weight",
+                          self.buf_a, self.buf_ssm_out, sh[1], sh[0])
         K.add_inplace(self.device, self.buf_a, self.buf_ssm_out, D_MODEL)
 
-        # Attention
-        K.rms_norm(self.device, self.buf_a, self.buf_b,
-                   self._w(f"blk.{li}.attn_norm.weight"), 1, D_MODEL)
+        # Attention: fused norm + QKV projection
         sh = s(f"blk.{li}.attn_qkv.weight")
-        self._matvec(f"blk.{li}.attn_qkv.weight",
-                     self.buf_b, self.buf_qkv, sh[1], sh[0])
+        self._norm_matvec(f"blk.{li}.attn_norm.weight",
+                          f"blk.{li}.attn_qkv.weight",
+                          self.buf_a, self.buf_qkv, sh[1], sh[0])
         K.rope_fused_qkv(self.device, self.buf_qkv, 0, 4096,
                          HEAD_DIM, N_HEADS, N_KV_HEADS, seq_pos)
         sh = s(f"blk.{li}.attn_gate.weight")
@@ -114,7 +140,8 @@ class Model:
                      self.buf_qkv, self.buf_gate_out, sh[1], sh[0])
         K.add_inplace(self.device, self.buf_a, self.buf_gate_out, D_MODEL)
 
-        # FFN (with norm, same as attn-only blocks)
+        # FFN: norm → gate/up → swiglu → down → add
+        # (norm feeds 2 matvecs, keep separate)
         K.rms_norm(self.device, self.buf_a, self.buf_b,
                    self._w(f"blk.{li}.post_attention_norm.weight"), 1, D_MODEL)
         sh = s(f"blk.{li}.ffn_gate.weight")
