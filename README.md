@@ -29,6 +29,21 @@
 
 ---
 
+## Practical Status (measured, not aspirational)
+
+See [`AUDIT-ETAT.md`](AUDIT-ETAT.md) for the full honesty audit. In short:
+
+- **Real, proven on the Arc 130V** : the `ctypes`/OpenCL device layer + GPU kernels
+  (add, SGEMM, matvec_f32, rms_norm, softmax, GQA attention, SiLU).
+  `tests/validate_real_gpu.py` verifies **8/8 kernels correct against a
+  reference on the real GPU** (vendor `0x8086`, 56 EU, 7.96 GB).
+- **Not yet real** : "XMX" and "FlashAttention-2" (C++) are currently
+  CPU/OpenMP emulations on `float`, and the "Level Zero" backend wraps the same
+  OpenCL path. The Python `torch.xpu` bridge is a genuine **no-op today** because
+  `torch.xpu` is unavailable in the current (3.14 / broken-numpy) environment.
+
+---
+
 ## 📊 CUDA API vs XeCUDA Mapping Table
 
 | NVIDIA CUDA API | XeCUDA Equivalent | Functionality on Intel Arc |

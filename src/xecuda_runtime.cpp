@@ -10,6 +10,9 @@
 #include <cstring>
 #include <mutex>
 #include <atomic>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include <mutex>
 #include <unordered_map>
 
@@ -92,7 +95,7 @@ xeCudaError_t xeCudaMalloc(void** devPtr, size_t size) {
 xeCudaError_t xeCudaMallocHost(void** ptr, size_t size) {
     // Host allocation is CPU-side — use aligned malloc for zero-copy
     if (!ptr || size == 0) return xeCudaErrorInvalidValue;
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     *ptr = _aligned_malloc(size, 64);
 #else
     *ptr = nullptr;
@@ -118,7 +121,7 @@ xeCudaError_t xeCudaFree(void* devPtr) {
 
 xeCudaError_t xeCudaFreeHost(void* ptr) {
     if (!ptr) return xeCudaSuccess;
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     _aligned_free(ptr);
 #else
     free(ptr);

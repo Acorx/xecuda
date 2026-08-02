@@ -36,10 +36,10 @@ typedef struct xeDim3 xeDim3;
 
 // Thread Index Context Struct passed during kernel execution
 struct xeWorkItemContext {
-    xeDim3 threadIdx;
-    xeDim3 blockIdx;
-    xeDim3 blockDim;
-    xeDim3 gridDim;
+    xeDim3 tid;
+    xeDim3 bid;
+    xeDim3 bdim;
+    xeDim3 gdim;
 };
 
 // Global context thread local variable for kernel execution on Intel Arc
@@ -51,10 +51,10 @@ extern thread_local xeWorkItemContext g_xeWorkContext;
 }
 #endif
 
-#define threadIdx (g_xeWorkContext.threadIdx)
-#define blockIdx  (g_xeWorkContext.blockIdx)
-#define blockDim  (g_xeWorkContext.blockDim)
-#define gridDim   (g_xeWorkContext.gridDim)
+#define threadIdx (g_xeWorkContext.tid)
+#define blockIdx  (g_xeWorkContext.bid)
+#define blockDim  (g_xeWorkContext.bdim)
+#define gridDim   (g_xeWorkContext.gdim)
 
 // Parallel Execution Launcher for Intel Arc Vector/Xe Cores
 template <typename KernelFunc, typename... Args>
@@ -66,10 +66,10 @@ xeCudaError_t xeCudaLaunchKernel(KernelFunc kernel, xeDim3 grid, xeDim3 block, s
 
     if (totalThreads <= 1) {
         // Single-thread fallback: no OpenMP overhead
-        g_xeWorkContext.gridDim = grid;
-        g_xeWorkContext.blockDim = block;
-        g_xeWorkContext.blockIdx = xeDim3(0, 0, 0);
-        g_xeWorkContext.threadIdx = xeDim3(0, 0, 0);
+        g_xeWorkContext.gdim = grid;
+        g_xeWorkContext.bdim = block;
+        g_xeWorkContext.bid = xeDim3(0, 0, 0);
+        g_xeWorkContext.tid = xeDim3(0, 0, 0);
         kernel(args...);
     } else {
         // Each OpenMP thread processes one (grid, block) work-item
@@ -91,10 +91,10 @@ xeCudaError_t xeCudaLaunchKernel(KernelFunc kernel, xeDim3 grid, xeDim3 block, s
             unsigned int gy = (flat / (bx_max * by_max * bz_max * gx_max)) % gy_max;
             unsigned int gz = (flat / (bx_max * by_max * bz_max * gx_max * gy_max)) % gz_max;
 
-            g_xeWorkContext.gridDim = grid;
-            g_xeWorkContext.blockDim = block;
-            g_xeWorkContext.blockIdx = xeDim3(gx, gy, gz);
-            g_xeWorkContext.threadIdx = xeDim3(bx, by, bz);
+            g_xeWorkContext.gdim = grid;
+            g_xeWorkContext.bdim = block;
+            g_xeWorkContext.bid = xeDim3(gx, gy, gz);
+            g_xeWorkContext.tid = xeDim3(bx, by, bz);
 
             kernel(args...);
         }
