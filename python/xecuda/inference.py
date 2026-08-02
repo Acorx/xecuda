@@ -23,7 +23,7 @@ class IntelArcInferenceEngine:
         self._backend = None
 
         print(f"[XeCUDA Inference] Initialized Engine for {model_name} ({precision})")
-        print(f"[XeCUDA Inference] Hardware Acceleration: Intel Xe2 XMX + Intel Level Zero")
+        print(f"[XeCUDA Inference] Backend: llama-cpp-python (GGUF) — device target: {self.device}")
 
     def load_model(self):
         """Loads model via best available backend on Intel Arc."""

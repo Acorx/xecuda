@@ -64,9 +64,13 @@ class XeCudaDevice:
         self._ocl.clGetDeviceInfo(self._dev, 0x102C, 256, vendor_buf, None)
         self.vendor = vendor_buf.value.decode()
 
+        # CL_DEVICE_VENDOR_ID = 0x1001 (real PCI vendor id, e.g. 0x8086 = Intel)
+        vid = ctypes.c_uint32(0)
+        self._ocl.clGetDeviceInfo(self._dev, 0x1001, 4, ctypes.byref(vid), None)
+        self.vendor_id = hex(vid.value)
+
         self._ocl.clGetDeviceInfo(self._dev, 0x1097, 256, name_buf, None)
         self.driver_version = name_buf.value.decode()
-
         global_mem = ctypes.c_ulonglong(0)
         self._ocl.clGetDeviceInfo(self._dev, 0x101F, 8, ctypes.byref(global_mem), None)
         self.total_memory_bytes = global_mem.value
@@ -230,6 +234,7 @@ __kernel void memset_fill(__global uint* buf, const uint val, const int N) {
             "vendor": self.vendor,
             "driver": self.driver_version,
             "compute_units": self.num_compute_units,
+            "vendor_id": getattr(self, "vendor_id", "0x0"),
             "total_memory_gb": round(self.total_memory_bytes / (1024**3), 2),
             "max_alloc_gb": round(self.max_alloc_bytes / (1024**3), 2),
             "initialized": self.initialized,

@@ -1416,32 +1416,104 @@ def rope_qk_norm(device, ptr_q, ptr_k, ptr_q_norm_w, ptr_k_norm_w,
 
 
 # ═══════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
 # Benchmark utility
 # ═══════════════════════════════════════════════════════════════════════
 
 def benchmark_bandwidth(device, size_mb=64):
     size_bytes = size_mb * 1024 * 1024
     n_floats = size_bytes // 4
-
     buf = device.malloc(size_bytes)
     src = (ctypes.c_float * n_floats)(*[float(i % 65536) for i in range(n_floats)])
-
     t0 = time.perf_counter()
     device.write_buffer(buf, ctypes.byref(src), size_bytes)
     device.finish()
     t1 = time.perf_counter()
     write_bw = (size_bytes / (1024**3)) / (t1 - t0)
-
     out = (ctypes.c_float * n_floats)()
     t2 = time.perf_counter()
     device.read_buffer(buf, ctypes.byref(out), size_bytes)
     device.finish()
     t3 = time.perf_counter()
     read_bw = (size_bytes / (1024**3)) / (t3 - t2)
-
     device.free(buf)
-    return {
-        "size_mb": size_mb,
-        "write_bw_gbs": round(write_bw, 3),
-        "read_bw_gbs": round(read_bw, 3),
-    }
+    return {"size_mb": size_mb, "write_bw_gbs": round(write_bw, 3), "read_bw_gbs": round(read_bw, 3)}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# vector_add — real 1D elementwise GPU kernel
+# ═══════════════════════════════════════════════════════════════════════
+
+VECTOR_ADD_SRC = b"""
+__kernel void vector_add(
+    __global const float* a,
+    __global const float* b,
+    __global float* c,
+    const int n)
+{
+    int i = get_global_id(0);
+    if (i < n) c[i] = a[i] + b[i];
+}
+"""
+
+
+def vector_add(device, ptr_a, ptr_b, ptr_c, n):
+    k = _get_kernel(device, "vector_add", VECTOR_ADD_SRC, b"vector_add")
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_a), ctypes.c_void_p(ptr_b),
+        ctypes.c_void_p(ptr_c), ctypes.c_int32(n),
+    ])
+    gs = ((n + 255) // 256) * 256
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(gs)),
+        ctypes.pointer(ctypes.c_size_t(256)),
+        0, None, None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SGEMM — real 2D OpenCL matrix multiply, row-major [MxK]x[KxN]->[MxN]
+# ═══════════════════════════════════════════════════════════════════════
+
+SGEMM_SRC = b"""
+__kernel void sgemm(
+    __global const float* A,
+    __global const float* B,
+    __global float* C,
+    const int M, const int N, const int K)
+{
+    int idx = get_global_id(0);
+    if (idx >= M * N) return;
+    int row = idx / N;          /* exact row-major mapping */
+    int col = idx % N;
+    float sum = 0.0f;
+    for (int k = 0; k < K; k++)
+        sum += A[row * K + k] * B[k * N + col];
+    C[row * N + col] = sum;
+}
+"""
+
+
+def sgemm(device, ptr_a, ptr_b, ptr_c, M, N, K):
+    """C[M,N] = A[M,K] @ B[K,N]. Host arrays are device pointers (cl_mem)."""
+    k = _get_kernel(device, "sgemm", SGEMM_SRC, b"sgemm")
+    _set_args(device, k, [
+        ctypes.c_void_p(ptr_a), ctypes.c_void_p(ptr_b), ctypes.c_void_p(ptr_c),
+        ctypes.c_int32(M), ctypes.c_int32(N), ctypes.c_int32(K),
+    ])
+    total = ((M * N + 255) // 256) * 256
+    device._ocl.clEnqueueNDRangeKernel(
+        device._queue, k, 1, None,
+        ctypes.pointer(ctypes.c_size_t(total)),
+        ctypes.pointer(ctypes.c_size_t(16)),
+        0, None, None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Aliases matching names historically used by examples/tests.
+# ═══════════════════════════════════════════════════════════════════════
+matmul_q4km = matvec_q4k            # chunked-4-bit matvec (same kernel)
+matvec_q4km = matvec_q4k            # common alias used in docs
