@@ -734,11 +734,12 @@ def gqa_attention(device, ptr_q, ptr_k, ptr_v, ptr_out,
         ctypes.c_int32(seq_kv), ctypes.c_float(scale),
     ])
     total = n_heads * seq_q
-    gs = ((total + 255) // 256) * 256
+    local = min(total, 256)
+    gs = ((total + local - 1) // local) * local   # grid must be a multiple of local
     device._ocl.clEnqueueNDRangeKernel(
         device._queue, k, 1, None,
         ctypes.pointer(ctypes.c_size_t(gs)),
-        ctypes.pointer(ctypes.c_size_t(min(total, 256))),
+        ctypes.pointer(ctypes.c_size_t(local)),
         0, None, None,
     )
 
