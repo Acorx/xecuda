@@ -367,6 +367,11 @@ def swiglu_gate(device, ptr_gate, ptr_up, n):
 
 MATVEC_Q4K_SRC = b"""
 static inline float fp16_to_float(ushort h) {
+    if ((h & 0x7c00) == 0) {
+        float m = (float)(h & 0x03ff);
+        float v = m * 0.000000059604644775390625f; /* fp16 subnormal: m * 2^-24 (ggml) */
+        return (h & 0x8000) ? -v : v;
+    }
     uint f = ((h & 0x8000) << 16) | (((h & 0x7c00) + 0x1C000) << 13) | ((h & 0x03FF) << 13);
     return as_float(f);
 }
@@ -468,6 +473,11 @@ def matvec_q4k(device, ptr_w, ptr_x, ptr_y, n_rows, n_cols):
 
 MATVEC_Q6K_SRC = b"""
 static inline float fp16_to_float_q6(ushort h) {
+    if ((h & 0x7c00) == 0) {
+        float m = (float)(h & 0x03ff);
+        float v = m * 0.000000059604644775390625f; /* fp16 subnormal: m * 2^-24 (ggml) */
+        return (h & 0x8000) ? -v : v;
+    }
     uint f = ((h & 0x8000) << 16) | (((h & 0x7c00) + 0x1C000) << 13) | ((h & 0x03FF) << 13);
     return as_float(f);
 }
@@ -515,7 +525,7 @@ __kernel void matvec_q6k(
                 int q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
                 int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
                 int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                int q4 = ((ql[l] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
                 s0 += d * (float)sc[is]     * (float)q1 * x_local[x_off + n + l];
                 s1 += d * (float)sc[is + 2] * (float)q2 * x_local[x_off + n + 32 + l];
                 s2 += d * (float)sc[is + 4] * (float)q3 * x_local[x_off + n + 64 + l];
@@ -899,6 +909,11 @@ def add_rms_norm_reduce(device, ptr_x, ptr_res, ptr_out_rms, n, eps=1e-6):
 
 NORM_MATVEC_Q4K_SRC = b"""
 static inline float fp16_to_float_nm(ushort h) {
+    if ((h & 0x7c00) == 0) {
+        float m = (float)(h & 0x03ff);
+        float v = m * 0.000000059604644775390625f; /* fp16 subnormal: m * 2^-24 (ggml) */
+        return (h & 0x8000) ? -v : v;
+    }
     uint f = ((h & 0x8000) << 16) | (((h & 0x7c00) + 0x1C000) << 13) | ((h & 0x03FF) << 13);
     return as_float(f);
 }
@@ -1003,6 +1018,11 @@ def norm_matvec_q4k(device, ptr_w, ptr_x, ptr_norm_w, ptr_inv_rms, ptr_y, n_rows
 
 ADD_NORM_MATVEC_Q4K_SRC = b"""
 static inline float fp16_to_float_anm(ushort h) {
+    if ((h & 0x7c00) == 0) {
+        float m = (float)(h & 0x03ff);
+        float v = m * 0.000000059604644775390625f; /* fp16 subnormal: m * 2^-24 (ggml) */
+        return (h & 0x8000) ? -v : v;
+    }
     uint f = ((h & 0x8000) << 16) | (((h & 0x7c00) + 0x1C000) << 13) | ((h & 0x03FF) << 13);
     return as_float(f);
 }
